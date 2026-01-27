@@ -1,0 +1,564 @@
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import torch
+from torch.cuda.amp import autocast, GradScaler
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+
+rcParams["font.family"] = "serif"
+rcParams["font.serif"] = ["Times New Roman", "DejaVu Serif"]
+
+def confusion_matrix_show (cm,save_path='/home/qyl/CSD_data/1_CSD/DATA_clean/confusion_matrix.png'):
+    # Plot confusion matrix
+    plt.figure(figsize=(16, 16),dpi=60)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.title('Confusion Matrix')
+    # 保存图片
+    plt.savefig(save_path, bbox_inches='tight', dpi=300)
+
+    # 显示图片
+    plt.show()
+
+    # 清理当前图形
+    plt.close()
+
+from sklearn.metrics import confusion_matrix, accuracy_score
+
+
+def adaptive_clip_grad(parameters, clip_factor=0.01, eps=1e-3):
+    for param in parameters:
+        if param.grad is None:
+            continue
+        param_norm = torch.norm(param)
+        grad_norm = torch.norm(param.grad)
+        if param_norm < eps:
+            continue
+        max_norm = param_norm * clip_factor
+        clip_coef = max_norm / (grad_norm + eps)
+        if clip_coef < 1:
+            param.grad.data.mul_(clip_coef)
+
+import torch
+import numpy as np
+from sklearn.metrics import f1_score, confusion_matrix,recall_score
+from sklearn.metrics import classification_report
+class EarlyStopping:
+    def __init__(self, patience=20, min_delta=0.001, mode='max'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+
+    def __call__(self, score):
+        if self.best_score is None:
+            self.best_score = score
+        elif (self.mode == 'max' and score > self.best_score + self.min_delta) or \
+             (self.mode == 'min' and score < self.best_score - self.min_delta):
+            self.best_score = score
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        return self.early_stop
+
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+
+
+#F1分数以及更新的早停机制
+def plot_model_accuracies(accuracies_history,title):
+    """
+    绘制四个模型的准确率变化曲线，包括训练集和验证集
+
+    Args:
+        accuracies_history: 包含每个epoch的准确率记录的字典
+        格式为：{
+            'train': [acc1, acc2, ...],  # 训练集准确率
+            'gnn': [acc1, acc2, ...],    # 验证集准确率
+            'rf': [acc1, acc2, ...],
+            'xgb': [acc1, acc2, ...],
+            'ensemble': [acc1, acc2, ...]
+        }
+    """
+    plt.figure(figsize=(12, 6))
+    epochs = range(1, len(accuracies_history['gnn']) + 1)
+
+    # 绘制训练集准确率曲线
+    plt.plot(epochs, accuracies_history['train'], 'k--', label='Train', linewidth=2)
+
+    # 绘制验证集上每个模型的准确率曲线
+    plt.plot(epochs, accuracies_history['gnn'], 'b-', label='GNN (Val)', linewidth=2)
+    plt.plot(epochs, accuracies_history['rf'], 'r-', label='RF (Val)', linewidth=2)
+    plt.plot(epochs, accuracies_history['xgb'], 'g-', label='XGB (Val)', linewidth=2)
+    plt.plot(epochs, accuracies_history['ensemble'], 'purple', label='Ensemble (Val)', linewidth=2)
+
+    plt.title(f'{title}Model Accuracies over Training Epochs', fontsize=14)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Accuracy', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=10)
+
+    # 设置y轴范围，确保能看到细节
+    plt.ylim(0.4, 1.0)
+
+    # 添加网格
+    plt.grid(True, linestyle='--', alpha=0.7)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def extract_raw_features(data):
+    """
+    只提取原始特征，不使用任何模型中间特征
+    """
+    # 提取分子指纹特征
+    fingerprint_features = data.fingerprint.cpu().numpy()
+
+    # 提取金属特征
+    metal_features = data.metal_feats.cpu().numpy()
+
+    # 提取所有溶剂特征
+    solvent_features = np.concatenate([
+        data.solvent1_feats.cpu().numpy(),
+        data.solvent2_feats.cpu().numpy(),
+        data.solvent3_feats.cpu().numpy(),
+        data.solvent4_feats.cpu().numpy()
+    ], axis=1)
+
+    # 合并所有原始特征
+    features = np.hstack([
+        fingerprint_features,
+        metal_features,
+        solvent_features
+    ])
+
+    return features
+
+
+def extract_initial_features(data_loaders):
+    """
+    在训练开始前提取所有数据集的原始特征
+    """
+    features = {'train': [], 'val': [], 'test': []}
+    labels = {'train': [], 'val': [], 'test': []}
+    ids = {'train': [], 'val': [], 'test': []}
+
+    for split in ['train', 'val', 'test']:
+        for data in data_loaders[split]:
+            # 只提取原始特征
+            feat = extract_raw_features(data)
+            features[split].append(feat)
+            labels[split].append(data.y.cpu().numpy())
+            ids[split].extend(data.id)
+
+            # 合并特征和标签
+    for split in features:
+        features[split] = np.vstack(features[split])
+        labels[split] = np.concatenate(labels[split])
+
+    return features, labels, ids
+
+
+def plot_training_history(history, title=""):
+    """
+    绘制训练历史曲线
+
+    Args:
+        history (dict): 包含'train_acc'和'val_acc'的字典
+        title (str): 图表标题前缀
+    """
+    plt.figure(figsize=(10, 6))
+    epochs = range(1, len(history['train_acc']) + 1)
+
+    # 绘制训练集和验证集的准确率曲线
+    plt.plot(epochs, history['train_acc'], 'b-', label='Training Accuracy')
+    plt.plot(epochs, history['val_acc'], 'r-', label='Validation Accuracy')
+
+    # 设置图表属性
+    plt.title(f'{title}Model Accuracy over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(loc='lower right')
+
+    # 添加网格和边框
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.gca().spines['top'].set_visible(False)
+    plt.gca().spines['right'].set_visible(False)
+
+    # Y轴范围设置为0-1
+    plt.ylim(0, 1.0)
+
+    # 保存图片
+    save_path = f'/home/qyl/CSD_data/1_CSD/logs/ensemble/training_history_{title.lower().replace(" ", "_")}.png'
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"Training history plot saved as: {save_path}")
+
+
+def plot_confusion_matrix(labels, preds, class_names, title,
+                          cmap="Blues", normalize=True, save_path=None):
+    """
+    论文级混淆矩阵绘制
+    """
+    cm = confusion_matrix(labels, preds)
+
+    if normalize:
+        cm = cm.astype("float") / cm.sum(axis=1, keepdims=True)
+
+    plt.figure(figsize=(5.5, 4.5))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt=".2f" if normalize else "d",
+        cmap=cmap,
+        xticklabels=class_names,
+        yticklabels=class_names,
+        square=True,
+        linewidths=0.5,
+        cbar=True
+    )
+
+    plt.xlabel("Predicted label")
+    plt.ylabel("True label")
+    plt.title(title)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300)
+    plt.close()
+
+import os
+import os
+import matplotlib.pyplot as plt
+
+def plot_and_save_metrics_history(
+    history,
+    train_loss_list,
+    val_loss_list,
+    test_metrics,
+    save_dir,
+    title="Descriptor"
+):
+    """
+    分别绘制并保存 Loss、Accuracy、F1、Recall 四个单独图像
+    字体：Times New Roman（适合论文）
+    """
+
+    # ------------------ 全局字体设置 ------------------
+    plt.rcParams["font.family"] = "Times New Roman"
+    plt.rcParams["axes.titlesize"] = 22
+    plt.rcParams["axes.labelsize"] = 20
+    plt.rcParams["xtick.labelsize"] = 16
+    plt.rcParams["ytick.labelsize"] = 16
+    plt.rcParams["legend.fontsize"] = 16
+    plt.rcParams["lines.linewidth"] = 2.5
+
+    os.makedirs(save_dir, exist_ok=True)
+    print(f"图像将保存到: {save_dir}")
+
+    epochs_range = range(1, len(history["train_acc"]) + 1)
+    test_epoch_x = len(history["val_acc"])
+
+    # ================== 1. Loss ==================
+    plt.figure(figsize=(10, 7))
+    plt.plot(epochs_range, train_loss_list, "b--", label="Train Loss")
+    plt.plot(epochs_range, val_loss_list, "g--", label="Validation Loss")
+    if test_metrics.get("loss") is not None:
+        plt.plot(test_epoch_x, test_metrics["loss"], "ro", markersize=10, label="Test Loss")
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(f"Loss Curve - {title}")
+    plt.legend()
+    plt.grid(True)
+
+    save_path = os.path.join(save_dir, f"{title}_loss.png")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"已保存 Loss 图像: {save_path}")
+
+    # ================== 2. Accuracy ==================
+    plt.figure(figsize=(10, 7))
+    plt.plot(epochs_range, history["train_acc"], "b--", label="Train Accuracy")
+    plt.plot(epochs_range, history["val_acc"], "g--", label="Validation Accuracy")
+    if test_metrics.get("acc") is not None:
+        plt.plot(test_epoch_x, test_metrics["acc"], "ro", markersize=10, label="Test Accuracy")
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.title(f"Accuracy Curve - {title}")
+    plt.legend()
+    plt.grid(True)
+
+    save_path = os.path.join(save_dir, f"{title}_accuracy.png")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"已保存 Accuracy 图像: {save_path}")
+
+    # ================== 3. F1 Score ==================
+    plt.figure(figsize=(10, 7))
+    plt.plot(epochs_range, history["train_f1"], "b--", label="Train F1")
+    plt.plot(epochs_range, history["val_f1"], "g--", label="Validation F1")
+    if test_metrics.get("f1") is not None:
+        plt.plot(test_epoch_x, test_metrics["f1"], "ro", markersize=10, label="Test F1")
+
+    plt.xlabel("Epoch")
+    plt.ylabel("F1 Score")
+    plt.title(f"F1 Score Curve - {title}")
+    plt.legend()
+    plt.grid(True)
+
+    save_path = os.path.join(save_dir, f"{title}_f1.png")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"已保存 F1 图像: {save_path}")
+
+    # ================== 4. Recall ==================
+    plt.figure(figsize=(10, 7))
+    plt.plot(epochs_range, history["train_recall"], "b--", label="Train Recall")
+    plt.plot(epochs_range, history["val_recall"], "g--", label="Validation Recall")
+    if test_metrics.get("recall") is not None:
+        plt.plot(test_epoch_x, test_metrics["recall"], "ro", markersize=10, label="Test Recall")
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Recall")
+    plt.title(f"Recall Curve - {title}")
+    plt.legend()
+    plt.grid(True)
+
+    save_path = os.path.join(save_dir, f"{title}_recall.png")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"已保存 Recall 图像: {save_path}")
+def plot_loss_f1_curves(train_loss, val_loss, train_f1, val_f1, save_path):
+    sns.set(style="whitegrid", context="talk")
+
+    fig, ax1 = plt.subplots(figsize=(7, 5))
+
+    color1 = "#1f77b4"
+    color2 = "#d62728"
+
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss", color=color1)
+    ax1.plot(train_loss, color=color1, linestyle="--", label="Train Loss")
+    ax1.plot(val_loss, color=color1, linestyle="-", label="Val Loss")
+    ax1.tick_params(axis='y', labelcolor=color1)
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel("F1 Score", color=color2)
+    ax2.plot(train_f1, color=color2, linestyle="--", label="Train F1")
+    ax2.plot(val_f1, color=color2, linestyle="-", label="Val F1")
+    ax2.tick_params(axis='y', labelcolor=color2)
+
+    lines, labels = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines + lines2, labels + labels2, loc="center right")
+
+    plt.title("Training and Validation Loss / F1")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+def train_and_evaluate(model, optimizer, scheduler, criterion, data_loaders, epochs, device, sample_weights=None,
+                       title=""):
+    """训练和评估模型"""
+    best_val_loss = float('inf')
+    best_model_state_dict = None
+    best_train_results = None
+    best_val_results = None
+    early_stopping = EarlyStopping(patience=20, min_delta=0.001, mode='min')
+    scaler = GradScaler()
+
+    history = {
+        'train_acc': [], 'val_acc': [],
+        'train_f1': [], 'val_f1': [],
+        'train_recall': [], 'val_recall': []
+    }
+    train_loss_list = []
+    val_loss_list = []
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        correct_predictions = 0
+        train_preds, train_labels, train_ids = [], [], []
+
+        for i, data in enumerate(data_loaders['train']):
+            data = data.to(device)
+            optimizer.zero_grad()
+            with autocast():
+                outputs = model(data)
+                labels = data.y - 1
+                labels = labels.to(device)
+                loss = criterion(outputs, labels.long())
+                if sample_weights is not None:
+                    loss = loss * sample_weights[i * data.num_graphs:(i + 1) * data.num_graphs].to(device)
+                    loss = loss.mean()
+            scaler.scale(loss).backward()
+            adaptive_clip_grad(model.parameters(), clip_factor=0.01)
+            scaler.step(optimizer)
+            scaler.update()
+            running_loss += loss.item() * data.num_graphs
+            _, preds = torch.max(outputs, 1)
+            preds = preds + 1
+            correct_predictions += torch.sum(preds == data.y)
+            train_preds.extend(preds.cpu().numpy())
+            train_labels.extend(data.y.cpu().numpy())
+            train_ids.extend(data.id)
+            torch.cuda.empty_cache()
+
+        train_loss = running_loss / len(data_loaders['train'].dataset)
+        train_acc_tensor = correct_predictions.double() / len(data_loaders['train'].dataset)  # This is a tensor
+        train_f1 = f1_score(train_labels, train_preds, average='weighted')
+        train_recall = recall_score(train_labels, train_preds, average='weighted')
+
+        train_loss_list.append(train_loss)
+        history['train_acc'].append(train_acc_tensor.item())  # Convert to float for history
+        history['train_f1'].append(train_f1)
+        history['train_recall'].append(train_recall)
+
+        val_metrics = evaluate_model(model, criterion, data_loaders['val'], device)
+
+        val_loss_list.append(val_metrics['loss'])
+        history['val_acc'].append(val_metrics['acc'])  # CORRECTED: No .item() needed, it's already a float
+        history['val_f1'].append(val_metrics['f1'])
+        history['val_recall'].append(val_metrics['recall'])
+
+        print(f"\nEpoch {epoch + 1}/{epochs}")
+        print(
+            f"Training - Loss: {train_loss:.4f}, Acc: {train_acc_tensor.item():.4f}, F1: {train_f1:.4f}, Recall: {train_recall:.4f}")
+        print(
+            f"Validation - Loss: {val_metrics['loss']:.4f}, Acc: {val_metrics['acc']:.4f}, F1: {val_metrics['f1']:.4f}, Recall: {val_metrics['recall']:.4f}")
+
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            best_model_state_dict = model.state_dict()
+            best_train_results = (train_preds, train_labels, train_ids)
+            best_val_results = (val_metrics['preds'], val_metrics['labels'], val_metrics['ids'])
+
+        scheduler.step(val_metrics["loss"])
+        if early_stopping(val_metrics["loss"]):
+            print("Early stopping triggered")
+            break
+
+    model.load_state_dict(best_model_state_dict)
+    test_metrics = {
+        'loss': None, 'acc': None, 'f1': None, 'recall': None,
+        'labels': [], 'preds': [], 'ids': []
+    }
+    if data_loaders.get('test') is not None:
+        test_metrics.update(evaluate_model(model, criterion, data_loaders['test'], device))
+
+    plot_and_save_metrics_history(history, train_loss_list, val_loss_list, test_metrics, "/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4",title)
+
+    def safe_format(value):
+        if value is None: return "N/A"
+        try:
+            return f"{float(value):.4f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    print("\nFinal Test Results:")
+    print(
+        f"Test - Loss: {safe_format(test_metrics['loss'])}, Acc: {safe_format(test_metrics['acc'])}, F1: {safe_format(test_metrics['f1'])}, Recall: {safe_format(test_metrics['recall'])}")
+    if test_metrics['labels']:
+        test_cm = confusion_matrix(test_metrics['labels'], test_metrics['preds'])
+        print("Confusion Matrix:")
+        print(test_cm)
+    else:
+        print("No test labels available for confusion matrix")
+
+    train_preds_best, train_labels_best, _ = best_train_results
+    val_preds_best, val_labels_best, _ = best_val_results
+    test_preds_best, test_labels_best = test_metrics['preds'], test_metrics['labels']
+    all_labels_combined = np.unique(np.concatenate(
+        [train_labels_best, val_labels_best, test_labels_best] if test_labels_best else [train_labels_best,
+                                                                                         val_labels_best]))
+    class_names = [f'Class {int(i)}' for i in all_labels_combined]
+    save_path = "/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_rl"
+    if train_labels_best:
+        plot_confusion_matrix(
+            train_labels_best, train_preds_best,
+            class_names,
+            title="Training Set",
+            cmap="Greens",
+            save_path=f"{save_path}/confusion_train.png"
+        )
+    if val_labels_best:
+        plot_confusion_matrix(
+            val_labels_best, val_preds_best,
+            class_names,
+            title="Validation Set",
+            cmap="Blues",
+            save_path=f"{save_path}/confusion_val.png"
+        )
+    if test_labels_best:
+        plot_loss_f1_curves(
+            train_loss_list,
+            val_loss_list,
+            history['train_f1'],
+            history['val_f1'],
+            save_path="/home/qyl/CSD_data/1_CSD/logs/ensemble/loss_f1_curve.png"
+        )
+    return model, best_train_results, best_val_results, (
+    test_metrics['preds'], test_metrics['labels'], test_metrics['ids']), train_loss_list, val_loss_list, test_metrics[
+        "loss"]
+
+
+def evaluate_model(model, criterion, data_loader, device):
+    """评估模型性能"""
+    model.eval()
+    running_loss = 0.0
+    correct_predictions = 0
+    all_preds = []
+    all_labels = []
+    all_ids = []
+
+    with torch.no_grad():
+        for data in data_loader:
+            data = data.to(device)
+            with autocast():
+                outputs = model(data)
+                labels = data.y - 1
+                loss = criterion(outputs, labels.long())
+                if loss.dim() > 0:
+                    loss = loss.mean()
+                running_loss += loss.item() * data.num_graphs
+            _, preds = torch.max(outputs, 1)
+            preds = preds + 1
+            correct_predictions += torch.sum(preds == data.y)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(data.y.cpu().numpy())
+            all_ids.extend(data.id)
+
+    dataset_size = len(data_loader.dataset)
+
+    # CORRECTED: Convert accuracy tensor to a standard Python float using .item()
+    accuracy = (correct_predictions.double() / dataset_size).item()
+
+    metrics = {
+        'loss': running_loss / dataset_size,
+        'acc': accuracy,
+        'f1': f1_score(all_labels, all_preds, average='weighted', zero_division=0),
+        'recall': recall_score(all_labels, all_preds, average='weighted', zero_division=0),
+        'preds': all_preds,
+        'labels': all_labels,
+        'ids': all_ids
+    }
+    return metrics
