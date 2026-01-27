@@ -1,0 +1,247 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv, GCNConv, SAGEConv, GINConv, EdgeConv
+from torch_geometric.nn import global_mean_pool as scatter_mean
+from torch_geometric.utils import softmax
+from torch_scatter import scatter_mean
+from torch_geometric.nn.pool.select.topk import topk
+from torch_geometric.nn.pool.connect.filter_edges import filter_adj
+
+class SolventAttention(nn.Module):
+    def __init__(self, input_dim=36, hidden_dim=64, output_dim=64, num_heads=4, dropout=0.1):
+        super(SolventAttention, self).__init__()
+        self.feature_transform = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
+            nn.Dropout(dropout)
+        )
+        self.multihead_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.output_transform = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, solvent1, solvent2, solvent3, solvent4):
+        s1 = self.feature_transform(solvent1.squeeze(1))
+        s2 = self.feature_transform(solvent2.squeeze(1))
+        s3 = self.feature_transform(solvent3.squeeze(1))
+        s4 = self.feature_transform(solvent4.squeeze(1))
+        solvent_combined = torch.stack([s1, s2, s3, s4], dim=1)
+        attn_output, _ = self.multihead_attn(solvent_combined, solvent_combined, solvent_combined)
+        pooled = torch.mean(attn_output, dim=1)
+        output = self.output_transform(pooled)
+        return output
+
+# SAG池化层（保持不变）
+class SAGPool(nn.Module):
+    def __init__(self, in_channels, ratio=0.8, conv_type='GCN', non_linearity=torch.tanh):
+        super(SAGPool, self).__init__()
+        self.in_channels = in_channels
+        self.ratio = ratio
+        self.non_linearity = non_linearity
+        if conv_type == 'GCN':
+            self.score_layer = GCNConv(in_channels, 1)
+        elif conv_type == 'SAGE':
+            self.score_layer = SAGEConv(in_channels, 1)
+        elif conv_type == 'GAT':
+            self.score_layer = GATConv(in_channels, 1)
+        elif conv_type == 'GIN':
+            self.score_layer = GINConv(nn.Sequential(
+                nn.Linear(in_channels, in_channels),
+                nn.ReLU(),
+                nn.Linear(in_channels, 1)
+            ))
+        else:
+            raise ValueError(f"不支持的卷积类型: {conv_type}")
+
+    def forward(self, x, edge_index, edge_attr=None, batch=None):
+        if batch is None:
+            batch = edge_index.new_zeros(x.size(0))
+        score = self.score_layer(x, edge_index).squeeze()
+        score = self.non_linearity(score)
+        normalized_score = softmax(score, batch)
+        perm = topk(normalized_score, self.ratio, batch)
+        x = x[perm] * normalized_score[perm].view(-1, 1)
+        batch = batch[perm]
+        edge_index, edge_attr = filter_adj(edge_index, edge_attr, perm, num_nodes=score.size(0))
+        return x, edge_index, edge_attr, batch, perm
+
+# 增强编码器（调整输出维度）
+class EnhancedEncoder(nn.Module):
+    def __init__(self, node_features, edge_features, hidden_dim, output_dim, num_layers=3):
+        super(EnhancedEncoder, self).__init__()
+        self.num_layers = num_layers
+        self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        self.pools = nn.ModuleList()
+
+        # 第一层
+        self.convs.append(GATConv(node_features, hidden_dim))
+        self.bns.append(nn.BatchNorm1d(hidden_dim))
+        self.pools.append(SAGPool(hidden_dim, ratio=0.8, conv_type="GAT"))
+
+        # 中间层
+        for _ in range(num_layers - 2):
+            self.convs.append(GATConv(hidden_dim, hidden_dim, heads=4, concat=False))
+            self.bns.append(nn.BatchNorm1d(hidden_dim))
+            self.pools.append(SAGPool(hidden_dim, ratio=0.8, conv_type="GAT"))
+
+        # 最后一层输出维度对齐hidden_dim
+        self.convs.append(GCNConv(hidden_dim, output_dim))
+        self.bns.append(nn.BatchNorm1d(output_dim))
+        self.pools.append(SAGPool(output_dim, ratio=0.8, conv_type="GAT"))
+
+        self.global_attention = nn.Sequential(nn.Linear(output_dim, 1), nn.Sigmoid())
+
+    def forward(self, x, edge_index, batch):
+        for i in range(self.num_layers):
+            x_in = x
+            x = self.convs[i](x, edge_index)
+            x = self.bns[i](x)
+            x = F.relu(x)
+            x, edge_index, _, batch, _ = self.pools[i](x, edge_index, None, batch)
+            if x_in.size(0) == x.size(0):  # 跳过连接条件
+                x = x + x_in
+
+        attention_weights = self.global_attention(x)
+        x = x * attention_weights
+        x = scatter_mean(x, batch, dim=0)
+        return x
+
+# GNN主类（关键维度调整）
+class GNN(nn.Module):
+    def __init__(self, node_features, edge_features, metal_features, solvent_features=36,
+                 hidden_dim=128, output_dim=128, num_classes=4, dropout_ratio=0.1):  # 修改output_dim=hidden_dim
+        super(GNN, self).__init__()
+        drop = dropout_ratio
+        self.hidden_dim = hidden_dim
+
+        # 图编码器输出维度对齐hidden_dim
+        self.encoder = EnhancedEncoder(
+            node_features=node_features,
+            edge_features=edge_features,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,  # 与hidden_dim一致
+            num_layers=3
+        )
+
+        # 金属特征处理
+        self.metal_fc = nn.Sequential(
+            nn.Linear(metal_features, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim)  # 输出维度保持hidden_dim
+        )
+        self.metal_weight = nn.Parameter(torch.tensor(2.0))
+
+        # 溶剂注意力输出维度对齐
+        self.solvent_attention = SolventAttention(
+            input_dim=solvent_features,
+            hidden_dim=64,
+            output_dim=hidden_dim,  # 输出维度与hidden_dim一致
+            num_heads=4,
+            dropout=drop
+        )
+
+        # 特征融合维度调整
+        combined_dim = hidden_dim * 4  # graph + metal + solvent + interaction
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(combined_dim, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Tanh(),
+            nn.Dropout(drop),
+            nn.Linear(hidden_dim * 2, hidden_dim * 2)  # 输出双倍维度用于门控拆分
+        )
+
+        # 门控机制
+        self.gate_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Sigmoid()
+        )
+
+        # 最终输出
+        self.output_layer = nn.Linear(hidden_dim, num_classes)
+        self.dropout = nn.Dropout(drop)
+
+    def forward(self, data):
+        device = next(self.parameters()).device
+        x, edge_index, batch = data.x.to(device), data.edge_index.to(device), data.batch.to(device)
+
+        # 编码图特征
+        graph_features = self.encoder(x, edge_index, batch)  # (B, output_dim=hidden_dim)
+
+        # 处理金属特征
+        metal_feats = self.dropout(F.relu(self.metal_fc(data.metal_feats)))
+
+        # 溶剂注意力
+        solvent_feats = self.solvent_attention(
+            data.solvent1_feats,
+            data.solvent2_feats,
+            data.solvent3_feats,
+            data.solvent4_feats
+        )
+
+        # 特征交互
+        interaction_features = graph_features * metal_feats  # 维度一致
+
+        # 特征融合
+        combined_features = torch.cat([
+            graph_features,
+            metal_feats * self.metal_weight,
+            solvent_feats,
+            interaction_features
+        ], dim=1)  # (B, 4*hidden_dim)
+
+        fused_features = self.fusion_layer(combined_features)
+
+        # 门控机制
+        main_path, gate_path = torch.split(fused_features, [self.hidden_dim, self.hidden_dim], dim=1)
+        gate = self.gate_layer(gate_path)
+        gated_features = main_path * gate
+
+        # 最终输出
+        output = self.output_layer(gated_features)
+        return output
+
+    def compute_loss(self, outputs, labels):
+        if labels.min() == 0:
+            pass
+        else:
+            labels = labels - 1
+
+        num_classes = outputs.size(1)
+        class_counts = torch.bincount(labels.long(), minlength=num_classes)
+
+        class_weights = torch.zeros(num_classes, dtype=torch.float, device=outputs.device)
+        non_zero_counts = (class_counts > 0)
+        class_weights[non_zero_counts] = 1.0 / class_counts[non_zero_counts].float()
+        class_weights /= class_weights.sum()
+
+        return F.cross_entropy(outputs, labels.long(), weight=class_weights)
+
+    @staticmethod
+    def freeze_layers(model, layers_to_freeze):
+        for name, param in model.named_parameters():
+            param.requires_grad = not any(layer_name in name for layer_name in layers_to_freeze)
+            if param.requires_grad:
+                print(f"Unfreezing layer: {name}")
+            else:
+                print(f"Freezing layer: {name}")
+
+    def freeze_components(self, components_to_freeze):
+        for name, module in self.named_children():
+            if name in components_to_freeze:
+                for param in module.parameters():
+                    param.requires_grad = False
+
+    @staticmethod
+    def unfreeze_layers(model, layers_to_unfreeze):
+        for name, param in model.named_parameters():
+            if any(layer_name in name for layer_name in layers_to_unfreeze):
+                param.requires_grad = True
+                print(f"Unfreezing layer: {name}")
+
