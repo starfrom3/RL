@@ -1,0 +1,2 @@
+1.GNN中process_data为预处理文件，model为模型架构文件，train_3为预训练过程，train_3_2为迁移学习过程，run为整体的工作流
+2.
