@@ -1,0 +1,1998 @@
+import argparse
+import copy
+import hashlib
+import json
+import logging
+import os
+import pickle
+import random
+import tempfile
+import warnings
+from collections import Counter
+from datetime import datetime
+from typing import List, Dict, Tuple, Optional
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+from rdkit import RDLogger
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.model_selection import GroupShuffleSplit, KFold
+from torch.utils.data import Subset
+from torch_geometric.data import DataLoader
+from torch_geometric.loader import DataLoader
+
+from model_3 import GNN
+from process_data_predict import MolecularDataProcessor, process_data_with_fingerprints
+from toolll import augment_data
+from train_3 import train_and_evaluate
+from train_3_2 import train_and_evaluate_2, evaluate_model_2
+
+warnings.filterwarnings('ignore')
+
+# 设置中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+lg = RDLogger.logger()
+lg.setLevel(RDLogger.CRITICAL)
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+temp_dir = '/home/qyl/tmp2'
+os.makedirs(temp_dir, exist_ok=True)
+os.environ['TMPDIR'] = temp_dir
+tempfile.tempdir = temp_dir
+print("当前临时目录:", tempfile.gettempdir())
+print("环境变量TMPDIR:", os.environ.get('TMPDIR'))
+
+
+class DataCacheManager:
+    """
+    数据缓存管理器 - 保存和加载处理好的数据
+    """
+
+    def __init__(self, cache_dir: str = "./data_cache"):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+
+    def _generate_cache_key(self, **kwargs) -> str:
+        """
+        生成缓存键值，基于数据处理参数
+        """
+        # 将参数转换为字符串并排序
+        param_str = json.dumps(kwargs, sort_keys=True, default=str)
+        # 生成MD5哈希
+        cache_key = hashlib.md5(param_str.encode()).hexdigest()[:16]
+        return cache_key
+
+    def _get_cache_info_path(self, cache_key: str) -> str:
+        """获取缓存信息文件路径"""
+        return os.path.join(self.cache_dir, f"{cache_key}_info.json")
+
+    def _get_cache_data_path(self, cache_key: str) -> str:
+        """获取缓存数据文件路径"""
+        return os.path.join(self.cache_dir, f"{cache_key}_data.pkl")
+
+    def save_processed_data(self,
+                            train_data: List,
+                            val_data: List,
+                            test_data: List,
+                            data_processor,
+                            cache_params: Dict) -> str:
+        """
+        保存处理好的数据
+
+        Args:
+            train_data: 训练数据
+            val_data: 验证数据
+            test_data: 测试数据
+            data_processor: 数据处理器（包含PCA等）
+            cache_params: 缓存参数（用于生成缓存键）
+
+        Returns:
+            str: 缓存键
+        """
+        cache_key = self._generate_cache_key(**cache_params)
+
+        # 保存数据
+        data_dict = {
+            'train_data': train_data,
+            'val_data': val_data,
+            'test_data': test_data,
+            'data_processor': data_processor,
+            'cache_params': cache_params,
+            'save_time': datetime.now().isoformat(),
+            'data_sizes': {
+                'train': len(train_data),
+                'val': len(val_data),
+                'test': len(test_data)
+            }
+        }
+
+        data_path = self._get_cache_data_path(cache_key)
+        with open(data_path, 'wb') as f:
+            pickle.dump(data_dict, f)
+
+        # 保存缓存信息
+        cache_info = {
+            'cache_key': cache_key,
+            'cache_params': cache_params,
+            'save_time': datetime.now().isoformat(),
+            'data_sizes': data_dict['data_sizes'],
+            'data_path': data_path
+        }
+
+        info_path = self._get_cache_info_path(cache_key)
+        with open(info_path, 'w') as f:
+            json.dump(cache_info, f, indent=2)
+
+        print(f"✅ 数据已保存到缓存: {cache_key}")
+        print(f"   训练集: {len(train_data)} 样本")
+        print(f"   验证集: {len(val_data)} 样本")
+        print(f"   测试集: {len(test_data)} 样本")
+        print(f"   缓存文件: {data_path}")
+
+        return cache_key
+
+    def load_processed_data(self, cache_key: str) -> Optional[Dict]:
+        """
+        加载处理好的数据
+
+        Args:
+            cache_key: 缓存键
+
+        Returns:
+            Dict: 包含数据和处理器的字典，如果不存在返回None
+        """
+        data_path = self._get_cache_data_path(cache_key)
+
+        if not os.path.exists(data_path):
+            print(f"❌ 缓存文件不存在: {cache_key}")
+            return None
+
+        try:
+            with open(data_path, 'rb') as f:
+                data_dict = pickle.load(f)
+
+            print(f"✅ 从缓存加载数据: {cache_key}")
+            print(f"   训练集: {len(data_dict['train_data'])} 样本")
+            print(f"   验证集: {len(data_dict['val_data'])} 样本")
+            print(f"   测试集: {len(data_dict['test_data'])} 样本")
+            print(f"   保存时间: {data_dict['save_time']}")
+
+            return data_dict
+
+        except Exception as e:
+            print(f"❌ 加载缓存失败: {e}")
+            return None
+
+    def check_cache_exists(self, **cache_params) -> Optional[str]:
+        """
+        检查缓存是否存在
+
+        Args:
+            **cache_params: 缓存参数
+
+        Returns:
+            str: 如果存在返回缓存键，否则返回None
+        """
+        cache_key = self._generate_cache_key(**cache_params)
+        data_path = self._get_cache_data_path(cache_key)
+
+        if os.path.exists(data_path):
+            return cache_key
+        return None
+
+    def list_cached_data(self) -> List[Dict]:
+        """
+        列出所有缓存的数据
+
+        Returns:
+            List[Dict]: 缓存信息列表
+        """
+        cached_data = []
+
+        for filename in os.listdir(self.cache_dir):
+            if filename.endswith('_info.json'):
+                info_path = os.path.join(self.cache_dir, filename)
+                try:
+                    with open(info_path, 'r') as f:
+                        cache_info = json.load(f)
+                    cached_data.append(cache_info)
+                except:
+                    continue
+
+        # 按时间排序
+        cached_data.sort(key=lambda x: x['save_time'], reverse=True)
+        return cached_data
+
+    def delete_cache(self, cache_key: str) -> bool:
+        """
+        删除指定的缓存
+
+        Args:
+            cache_key: 缓存键
+
+        Returns:
+            bool: 是否成功删除
+        """
+        data_path = self._get_cache_data_path(cache_key)
+        info_path = self._get_cache_info_path(cache_key)
+
+        success = True
+        if os.path.exists(data_path):
+            try:
+                os.remove(data_path)
+                print(f"✅ 删除缓存数据: {data_path}")
+            except Exception as e:
+                print(f"❌ 删除缓存数据失败: {e}")
+                success = False
+
+        if os.path.exists(info_path):
+            try:
+                os.remove(info_path)
+                print(f"✅ 删除缓存信息: {info_path}")
+            except Exception as e:
+                print(f"❌ 删除缓存信息失败: {e}")
+                success = False
+
+        return success
+
+    def get_cache_size(self) -> str:
+        """
+        获取缓存目录大小
+
+        Returns:
+            str: 缓存大小（人类可读格式）
+        """
+        total_size = 0
+        for filename in os.listdir(self.cache_dir):
+            filepath = os.path.join(self.cache_dir, filename)
+            if os.path.isfile(filepath):
+                total_size += os.path.getsize(filepath)
+
+        # 转换为人类可读格式
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if total_size < 1024.0:
+                return f"{total_size:.2f} {unit}"
+            total_size /= 1024.0
+        return f"{total_size:.2f} TB"
+
+
+def create_data_loaders_with_cache(
+        args,
+        df: pd.DataFrame,
+        metal_properties_sheet: pd.DataFrame,
+        solvent_properties_sheet: pd.DataFrame,
+        cache_manager: DataCacheManager,
+        force_reload: bool = False
+) -> Tuple[Dict, DataCacheManager,Dict]:
+    """
+    创建数据加载器（带缓存功能）
+
+    Args:
+        args: 命令行参数
+        df: 主数据框
+        metal_properties_sheet: 金属属性数据
+        solvent_properties_sheet: 溶剂属性数据
+        cache_manager: 缓存管理器
+        force_reload: 是否强制重新处理数据
+
+    Returns:
+        Tuple[Dict, DataCacheManager]: 数据加载器字典和缓存管理器
+    """
+
+    # 定义缓存参数（用于生成缓存键）
+    cache_params = {
+        'data_path': args.data_path,
+        'sheet': args.sheet,
+        'test_size': 0.2,
+        'random_state': 42,  # 使用固定的随机种子
+        'n_components': 50,
+        'source_batch_size': args.source_batch_size,
+        'ori_arg': args.ori_arg,
+        # 可以添加其他影响数据处理的参数
+        'data_hash': hashlib.md5(df.to_string().encode()).hexdigest()[:16]  # 数据内容哈希
+    }
+
+    # 检查缓存是否存在
+    cache_key = None
+    if not force_reload:
+        cache_key = cache_manager.check_cache_exists(**cache_params)
+
+    if cache_key:
+        print("🔄 发现缓存数据，正在加载...")
+
+        # 从缓存加载数据
+        cached_data = cache_manager.load_processed_data(cache_key)
+
+        if cached_data:
+            # 重新创建DataLoader
+            train_data = cached_data['train_data']
+            val_data = cached_data['val_data']
+            test_data = cached_data['test_data']
+            data_processor = cached_data['data_processor']
+
+            # 数据增强（如果需要）
+            if args.ori_arg:
+                print("🔄 应用数据增强...")
+                augmented_train_data = flexible_augment_data(
+                    train_data,
+                    augmentation_probability=1,
+                    max_augmentations=1
+                )
+                train_loader = DataLoader(augmented_train_data, batch_size=args.source_batch_size, shuffle=True)
+            else:
+                train_loader = DataLoader(train_data, batch_size=args.source_batch_size, shuffle=True)
+
+            val_loader = DataLoader(val_data, batch_size=args.source_batch_size, shuffle=False)
+            test_loader = DataLoader(test_data, batch_size=args.source_batch_size, shuffle=False)
+
+            origin_data={
+                "train": train_data,
+                "val": val_data,
+                "test": test_data,
+                "data_processor": data_processor  # 也返回数据处理器
+            }
+
+            data_loaders = {
+                "train": train_loader,
+                "val": val_loader,
+                "test": test_loader,
+                "data_processor": data_processor  # 也返回数据处理器
+            }
+
+            print("✅ 从缓存成功加载数据！")
+            return data_loaders, cache_manager,origin_data
+
+    # 缓存不存在或强制重新加载，执行完整的数据处理
+    print("🔄 缓存不存在或强制重新加载，开始处理数据...")
+
+    # 2. 数据集划分和特征提取
+    data_processor = MolecularDataProcessor(n_components=50)
+    random2 = 42
+
+    # 划分数据集并提取特征
+    (train_df, val_df, test_df), (train_fingerprints_transformed,
+                                  val_fingerprints_transformed,
+                                  test_fingerprints_transformed) = prepare_datasets(
+        df, data_processor, test_size=0.2, random_state=random2
+    )
+
+    # 保存PCA和StandardScaler模型
+    if args.pca_model_path:
+        os.makedirs(os.path.dirname(f"{args.pca_model_path}/{args.time}_{args.record}_{args.count}.pkl"), exist_ok=True)
+        data_processor.save_pca_model(f"{args.pca_model_path}/{args.time}_{args.record}_{args.count}.pkl")
+
+    # 3. 准备GNN数据
+    print("🔄 处理GNN数据...")
+    train_data = process_data_with_fingerprints(
+        train_df, metal_properties_sheet, solvent_properties_sheet,
+        train_fingerprints_transformed, augment=False
+    )
+    val_data = process_data_with_fingerprints(
+        val_df, metal_properties_sheet, solvent_properties_sheet,
+        val_fingerprints_transformed, augment=False
+    )
+    test_data = process_data_with_fingerprints(
+        test_df, metal_properties_sheet, solvent_properties_sheet,
+        test_fingerprints_transformed, augment=False
+    )
+
+    # 保存到缓存
+    print("💾 保存数据到缓存...")
+    cache_key = cache_manager.save_processed_data(
+        train_data, val_data, test_data, data_processor, cache_params
+    )
+
+    # 4. 创建数据加载器
+    if args.ori_arg:
+        print("🔄 应用数据增强...")
+        augmented_train_data = flexible_augment_data(
+            train_data,
+            augmentation_probability=1,
+            max_augmentations=1
+        )
+        train_loader = DataLoader(augmented_train_data, batch_size=args.source_batch_size, shuffle=True)
+    else:
+        train_loader = DataLoader(train_data, batch_size=args.source_batch_size, shuffle=True)
+
+    val_loader = DataLoader(val_data, batch_size=args.source_batch_size, shuffle=False)
+    test_loader = DataLoader(test_data, batch_size=args.source_batch_size, shuffle=False)
+
+    origin_data = {
+        "train": train_data,
+        "val": val_data,
+        "test": test_data,
+        "data_processor": data_processor  # 也返回数据处理器
+    }
+
+    data_loaders = {
+        "train": train_loader,
+        "val": val_loader,
+        "test": test_loader,
+        "data_processor": data_processor
+    }
+
+    print("✅ 数据处理完成并已缓存！")
+    return data_loaders, cache_manager,origin_data
+
+
+def manage_cache_interactive(cache_manager: DataCacheManager):
+    """
+    交互式管理缓存
+    """
+    print("\n📂 缓存管理器")
+    print("=" * 50)
+
+    # 列出所有缓存
+    cached_data = cache_manager.list_cached_data()
+
+    if not cached_data:
+        print("❌ 没有找到缓存数据")
+        return
+
+    print(f"📊 缓存总大小: {cache_manager.get_cache_size()}")
+    print(f"📁 缓存数量: {len(cached_data)}")
+    print("\n缓存列表:")
+
+    for i, cache_info in enumerate(cached_data):
+        print(f"\n{i + 1}. 缓存键: {cache_info['cache_key']}")
+        print(f"   保存时间: {cache_info['save_time']}")
+        print(f"   数据规模: 训练={cache_info['data_sizes']['train']}, "
+              f"验证={cache_info['data_sizes']['val']}, "
+              f"测试={cache_info['data_sizes']['test']}")
+
+        # 显示主要参数
+        if 'cache_params' in cache_info:
+            params = cache_info['cache_params']
+            print(f"   主要参数: batch_size={params.get('source_batch_size', 'N/A')}, "
+                  f"ori_arg={params.get('ori_arg', 'N/A')}")
+
+    # 提供删除选项
+    print("\n选项:")
+    print("0. 返回")
+    print("1. 删除指定缓存")
+    print("2. 清空所有缓存")
+
+    try:
+        choice = int(input("\n请选择操作: "))
+
+        if choice == 0:
+            return
+        elif choice == 1:
+            cache_num = int(input("请输入要删除的缓存编号: ")) - 1
+            if 0 <= cache_num < len(cached_data):
+                cache_key = cached_data[cache_num]['cache_key']
+                if cache_manager.delete_cache(cache_key):
+                    print("✅ 缓存删除成功")
+                else:
+                    print("❌ 缓存删除失败")
+            else:
+                print("❌ 无效的缓存编号")
+        elif choice == 2:
+            confirm = input("确认删除所有缓存? (y/N): ")
+            if confirm.lower() == 'y':
+                for cache_info in cached_data:
+                    cache_manager.delete_cache(cache_info['cache_key'])
+                print("✅ 所有缓存已删除")
+
+    except (ValueError, KeyboardInterrupt):
+        print("\n操作已取消")
+
+class EarlyStopping:
+    def __init__(self, patience=10, min_delta=0, verbose=False, delta=None, scheduler=None):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.verbose = verbose
+        self.delta = delta if delta is not None else min_delta
+        self.scheduler = scheduler
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+
+    def __call__(self, score):
+        if self.best_score is None:
+            self.best_score = score
+        elif score < self.best_score - self.min_delta:
+            self.best_score = score
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+                if self.verbose:
+                    print(f'Early stopping triggered after {self.patience} epochs without improvement.')
+
+    def step(self):
+        if self.scheduler:
+            self.scheduler.step()
+
+
+#保存文件
+def save_results_to_excel(train_results, val_results, test_results, output_dir, filename):
+    def to_cpu_numpy(tensor):
+        if isinstance(tensor, torch.Tensor):
+            return tensor.cpu().detach().numpy()
+        elif isinstance(tensor, np.ndarray):
+            return tensor
+        elif isinstance(tensor, list):
+            return np.array([to_cpu_numpy(t) for t in tensor])
+        return np.array(tensor)
+
+    train_preds, train_labels, train_ids = map(to_cpu_numpy, train_results)
+    val_preds, val_labels, val_ids = map(to_cpu_numpy, val_results)
+    test_preds, test_labels, test_ids = map(to_cpu_numpy, test_results)
+
+    df_train = pd.DataFrame({
+        'ID': train_ids,
+        'Actual': train_labels,
+        'Predicted': train_preds,
+        'Set': 'Train'
+    })
+
+    df_val = pd.DataFrame({
+        'ID': val_ids,
+        'Actual': val_labels,
+        'Predicted': val_preds,
+        'Set': 'Validation'
+    })
+
+    df_test = pd.DataFrame({
+        'ID': test_ids,
+        'Actual': test_labels,
+        'Predicted': test_preds,
+        'Set': 'Test'
+    })
+
+    df = pd.concat([df_train, df_val, df_test], ignore_index=True)
+    df = df.sort_values(['Set', 'ID'])
+
+    output_path = os.path.join(output_dir, filename)
+    df.to_excel(output_path, index=False)
+    print(f"Results saved to {output_path}")
+
+
+#随机判断数据是否增广
+def flexible_augment_data(data_list, augmentation_probability=0.5, max_augmentations=1):
+    augmented_data_list = []
+    for data in data_list:
+        augmented_data_list.append(data)
+
+        # 随机决定是否对这个数据点进行增强
+        if random.random() < augmentation_probability:
+            num_augmentations = random.randint(1, max_augmentations)
+            for _ in range(num_augmentations):
+                augmented_data_list.append(augment_data(data))
+
+    return augmented_data_list
+
+def calculate_metrics(preds, labels, ids):
+    accuracy = accuracy_score(labels, preds)
+    f1 = f1_score(labels, preds, average='weighted')
+    return {"accuracy": accuracy, "f1": f1}
+
+# 计算平均交叉验证结果
+def average_metrics(outputs):
+    avg_accuracy = np.mean([calculate_metrics(*output)['accuracy'] for output in outputs])
+    avg_f1 = np.mean([calculate_metrics(*output)['f1'] for output in outputs])
+    return {"accuracy": avg_accuracy, "f1": avg_f1}
+
+
+
+def assign_group_id_by_solvents(df):
+    """
+    基于 [SMILES, Solvent1, Solvent2, Solvent3, Solvent4] 列进行分组，
+    若多条记录在这些列上的取值完全相同，则分配相同的 group_id。
+    """
+    group_cols = ["SMILES", "Solvent1", "Solvent2", "Solvent3", "Solvent4"]
+    df["group_id"] = df.groupby(group_cols, dropna=False).ngroup()
+    return df
+
+def group_based_split(df, test_size=0.2, random_state=42):
+    """
+    使用 GroupShuffleSplit 将 df 分为 train_df 与 test_df，比例由 test_size 决定。
+    保证同一 group_id 的数据不会分拆到不同集。
+    """
+    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+
+    X = df.index  # 仅用作占位
+    y = df.index  # 仅用作占位
+    groups = df["group_id"].values
+
+    train_idx, test_idx = next(gss.split(X, y, groups=groups))
+
+    df_train = df.iloc[train_idx].copy()
+    df_test = df.iloc[test_idx].copy()
+
+    return df_train, df_test
+
+def prepare_datasets(df, data_processor, test_size=0.2, random_state=42, is_training=True):
+    """
+    准备训练、验证和测试数据集：
+      1) 根据 [SMILES, Solvent1, Solvent2, Solvent3, Solvent4] 进行分组；
+      2) 使用 group_based_split 先拆分出 (train_df, temp_df)，再拆分出 (val_df, test_df)；
+      3) 计算并(可选)PCA降维分子指纹。
+    """
+
+    # (a) 先给数据打上分组标签
+    df = assign_group_id_by_solvents(df)
+
+    # (b) 第一次拆分: 训练集 & 临时集 (temp)
+    #    例如，这里 test_size=0.2，表示先把 20% 数据留作 temp，其余 80% 作为训练集
+    train_df, temp_df = group_based_split(df, test_size=test_size, random_state=random_state)
+
+    # (c) 第二次拆分: 验证集 & 测试集（此处简单 1:1 拆分 temp_df，即 val 10%, test 10%）
+    val_df, test_df = group_based_split(temp_df, test_size=0.5, random_state=random_state)
+    # 确保拆分后的数据集包含 group_id
+    for subset in [train_df, val_df, test_df]:
+        assert "group_id" in subset.columns, f"拆分后的数据集 {subset} 缺少 group_id 列！"
+    # 2. 计算分子指纹
+    train_fingerprints_raw = data_processor.compute_fingerprints(train_df)
+    val_fingerprints_raw = data_processor.compute_fingerprints(val_df)
+    test_fingerprints_raw = data_processor.compute_fingerprints(test_df)
+
+    # 3. PCA处理
+    if is_training:
+        # 训练模式: 拟合并转换训练集, 仅转换验证集和测试集
+        train_fingerprints = data_processor.fit_transform_fingerprints(train_fingerprints_raw)
+        val_fingerprints = data_processor.transform_fingerprints(val_fingerprints_raw)
+        test_fingerprints = data_processor.transform_fingerprints(test_fingerprints_raw)
+    else:
+        # 预测/推理模式: 使用已有PCA模型转换
+        train_fingerprints = data_processor.transform_fingerprints(train_fingerprints_raw)
+        val_fingerprints = data_processor.transform_fingerprints(val_fingerprints_raw)
+        test_fingerprints = data_processor.transform_fingerprints(test_fingerprints_raw)
+
+    # 4. 返回数据集和对应指纹
+    return (train_df, val_df, test_df), (train_fingerprints, val_fingerprints, test_fingerprints)
+
+
+
+def _safe_model_copy(model):
+    """
+    Safely create a deep copy of a PyTorch model.
+
+    Args:
+        model (torch.nn.Module): Original model to copy
+
+    Returns:
+        torch.nn.Module: A deep copy of the model
+    """
+    if model is None:
+        return None
+
+    try:
+        # Deep copy the model's state dictionary
+        new_model = copy.deepcopy(model)
+
+        # Ensure the model is in the same mode as the original
+        new_model.train(model.training)
+
+        return new_model
+    except Exception as e:
+        logging.error(f"Model copy failed: {e}")
+        return None
+
+
+def _create_run_statistic(run_idx, best_loss, seed):
+    """
+    Create a dictionary of statistics for a single run.
+
+    Args:
+        run_idx (int): Current run index
+        best_loss (float): Best loss achieved in the run
+        seed (int): Random seed used for the run
+
+    Returns:
+        dict: Run statistics
+    """
+    return {
+        'run': run_idx + 1,
+        'best_loss': best_loss,
+        'seed': seed,
+        'timestamp': datetime.now().isoformat()
+    }
+
+
+def _evaluate_final_model(global_best_model, test_loader, device, logger=None):
+    """
+    Evaluate the final (global best) model on the test set.
+
+    Args:
+        global_best_model (torch.nn.Module): Best model from cross-validation
+        test_loader (DataLoader): Test data loader
+        device (torch.device): Computing device
+        logger (logging.Logger, optional): Logger for recording evaluation results
+
+    Returns:
+        dict: Test set evaluation metrics
+    """
+    if global_best_model is None:
+        if logger:
+            logger.error("No valid global best model for final evaluation")
+        return {'error': 'No valid model'}
+
+    try:
+        # Ensure model is in evaluation mode
+        global_best_model.eval()
+
+        # Prepare metrics tracking
+        total_loss = 0.0
+        correct_predictions = 0
+        total_samples = 0
+        all_predictions = []
+        all_targets = []
+
+        # Disable gradient computation
+        with torch.no_grad():
+            for batch in test_loader:
+                # Unpack batch (adjust according to your data structure)
+                inputs, targets = batch
+                inputs, targets = inputs.to(device), targets.to(device)
+
+                # Forward pass
+                outputs = global_best_model(inputs)
+
+                # Compute loss
+                loss = global_best_model.compute_loss(outputs, targets)
+                total_loss += loss.item()
+
+                # Compute predictions
+                _, predicted = torch.max(outputs, 1)
+                total_samples += targets.size(0)
+                correct_predictions += (predicted == targets).sum().item()
+
+                # Store for more detailed metrics
+                all_predictions.extend(predicted.cpu().numpy())
+                all_targets.extend(targets.cpu().numpy())
+
+        # Compute metrics
+        accuracy = correct_predictions / total_samples
+        avg_loss = total_loss / len(test_loader)
+
+        # Compute F1 Score
+        f1 = f1_score(all_targets, all_predictions, average='weighted')
+
+        # Logging
+        test_metrics = {
+            'loss': avg_loss,
+            'acc': accuracy,
+            'f1': f1,
+            'total_samples': total_samples,
+            'correct_predictions': correct_predictions
+        }
+
+        if logger:
+            logger.info("\n=== Final Test Evaluation ===")
+            logger.info(f"Loss: {avg_loss:.4f}")
+            logger.info(f"Accuracy: {accuracy:.4f}")
+            logger.info(f"F1 Score: {f1:.4f}")
+
+        return test_metrics
+
+    except Exception as e:
+        if logger:
+            logger.error(f"Test evaluation failed: {e}")
+        return {'error': str(e)}
+
+
+def _save_global_best_model(global_best_model, save_dir):
+    """
+    Save the global best model to a specified directory.
+
+    Args:
+        global_best_model (torch.nn.Module): Best model from cross-validation
+        save_dir (str): Directory to save the model
+
+    Returns:
+        str: Path to the saved model, or None if saving failed
+    """
+    if global_best_model is None:
+        logging.warning("No model to save")
+        return None
+
+    try:
+        # Ensure save directory exists
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Construct save path
+        save_path = os.path.join(save_dir, "global_best_model.pth")
+
+        # Save model state dictionary
+        torch.save(global_best_model.state_dict(), save_path)
+
+        logging.info(f"Global best model saved to {save_path}")
+        return save_path
+
+    except Exception as e:
+        logging.error(f"Failed to save global best model: {e}")
+        return None
+
+
+def _get_model_details(model):
+    """
+    Extract detailed information about the model.
+
+    Args:
+        model (torch.nn.Module): PyTorch model
+
+    Returns:
+        dict: Model details and summary
+    """
+    if model is None:
+        return {'error': 'No model provided'}
+
+    try:
+        # Total number of parameters
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        # Model architecture summary
+        model_summary = {
+            'total_parameters': total_params,
+            'trainable_parameters': trainable_params,
+            'parameter_ratio': trainable_params / total_params,
+            'model_type': type(model).__name__,
+        }
+
+        # Optional: Layer-wise parameter count
+        if hasattr(model, 'state_dict'):
+            layer_params = {
+                name: params.numel()
+                for name, params in model.state_dict().items()
+            }
+            model_summary['layer_parameters'] = layer_params
+
+        return model_summary
+
+    except Exception as e:
+        logging.error(f"Failed to get model details: {e}")
+        return {'error': str(e)}
+
+def _create_fold_record(run_idx, fold_idx, train_idx, val_idx, training_result, val_metrics):
+    """
+    Create a comprehensive record for a single fold.
+
+    Args:
+        run_idx (int): Current run index
+        fold_idx (int): Current fold index
+        train_idx (list): Training indices
+        val_idx (list): Validation indices
+        training_result (dict): Training result from train_and_evaluate_2
+        val_metrics (dict): Validation metrics
+
+    Returns:
+        dict: Detailed fold record
+    """
+    return {
+        'run': run_idx + 1,
+        'fold': fold_idx + 1,
+        'train_size': len(train_idx),
+        'val_size': len(val_idx),
+        'train_metrics': {
+            'loss': training_result.get('train_loss_history', [])[-1] if training_result.get(
+                'train_loss_history') else None,
+            # Add other train metrics as needed
+        },
+        'val_metrics': {
+            'loss': val_metrics.get('loss'),
+            'accuracy': val_metrics.get('acc'),
+            'f1_score': val_metrics.get('f1'),
+        },
+        'best_train_results': training_result.get('best_train_results'),
+        'best_val_results': training_result.get('best_val_results'),
+        'training_epochs': len(training_result.get('train_loss_history', [])),
+        'early_stopped': False  # You might want to track this explicitly
+    }
+
+
+def kf_cross_validate_transfer_learning(
+        model_template, full_dataset, test_loader, args, device, num_runs=10, n_splits=5
+):
+    # Logging setup
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s: %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(args.fine_save, 'cross_validation_log.txt')),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger(__name__)
+
+    # Global performance tracking
+    global_best_loss = float('inf')
+    global_best_model = None
+    all_fold_results = []
+    run_statistics = []
+
+    # Performance tracking containers
+    run_performance_history = {
+        'train_losses': [],
+        'val_losses': [],
+        'accuracies': [],
+        'f1_scores': []
+    }
+
+    for run_idx in range(num_runs):
+        # Reproducibility
+        run_seed = random.randint(0, 0xffff_ffff)
+        set_all_seeds(run_seed)
+
+        logger.info(f"\n{'#' * 30} Run {run_idx + 1}/{num_runs} (Seed: {run_seed}) {'#' * 30}")
+
+        # Run-level variables
+        run_best_loss = float('inf')
+        run_best_model = None
+        fold_records = []
+
+        # K-Fold Cross-Validation
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=run_seed)
+        for fold_idx, (train_idx, val_idx) in enumerate(kf.split(full_dataset)):
+            logger.info(f"\n{'=' * 20} Fold {fold_idx + 1}/{n_splits} {'=' * 20}")
+
+            # Safe model initialization
+            try:
+                model = _safe_model_initialization(
+                    model_template, device, run_idx, fold_idx
+                )
+
+                # 创建优化器和学习率调度器
+                optimizer = torch.optim.AdamW(
+                    filter(lambda p: p.requires_grad, model.parameters()),
+                    lr=args.lr,
+                    weight_decay=args.weight_decay
+                )
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer, mode='min', factor=0.5, patience=15
+                )
+
+            except Exception as init_error:
+                logger.error(f"Model initialization failed: {init_error}")
+                continue
+
+            # Data Loaders
+            train_loader, val_loader = _create_data_loaders(
+                full_dataset, train_idx, val_idx, args
+            )
+
+            # Training Pipeline
+            try:
+                # 传递优化器和学习率调度器
+                training_result = train_and_evaluate_2(
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    criterion=lambda pred, target: model.compute_loss(pred, target),
+                    data_loaders={"train": train_loader, "val": val_loader},
+                    epochs=args.epochs,
+                    device=device,
+                    title=f"Run{run_idx + 1}_Fold{fold_idx + 1}_"
+                )
+
+                # Extract trained model from training result
+                trained_model = training_result.get('model')
+                if trained_model is None:
+                    logger.error("No trained model found in training result")
+                    continue
+
+                # Evaluation
+                val_metrics = _evaluate_fold(
+                    trained_model, val_loader, device
+                )
+
+                # When tracking the best model in each fold
+                if val_metrics['loss'] < run_best_loss:
+                    run_best_loss = val_metrics['loss']
+
+                    # Create a safe copy of the model template
+                    run_best_model = _safe_model_copy(model_template)
+
+                    # Load the state dict from the trained model in training_result
+                    if training_result and 'model' in training_result:
+                        run_best_model.load_state_dict(training_result['model'].state_dict())
+
+                    run_best_model = run_best_model.to(device)
+
+                # Create fold record
+                fold_record = _create_fold_record(
+                    run_idx,
+                    fold_idx,
+                    train_idx,
+                    val_idx,
+                    training_result,  # Pass the entire training result
+                    val_metrics
+                )
+
+                # Add the fold record to fold_records
+                fold_records.append(fold_record)
+
+            except Exception as train_error:
+                logger.error(f"Training failed in Run {run_idx + 1}, Fold {fold_idx + 1}: {train_error}")
+                continue
+
+        # Save run's best model
+        _save_run_best_model(run_best_model, args.fine_save, run_idx)
+
+        # Update global best model
+        if run_best_loss < global_best_loss and run_best_model is not None:
+            global_best_loss = run_best_loss
+            global_best_model = _safe_model_copy(run_best_model)
+            logger.info(f"\n🔥 Global Best Updated! Run {run_idx + 1} Loss: {global_best_loss:.4f}")
+
+        # Aggregate run statistics
+        run_performance_history['train_losses'].append(run_best_loss)
+        run_statistics.append(_create_run_statistic(run_idx, run_best_loss, run_seed))
+        all_fold_results.extend(fold_records)
+
+    # Final model evaluation
+    test_metrics = _evaluate_final_model(
+        global_best_model, test_loader, device, logger
+    )
+
+    # Save global best model
+    _save_global_best_model(global_best_model, args.fine_save)
+
+    # Comprehensive results compilation
+    all_results = {
+        'global_best': {
+            'loss': global_best_loss,
+            'test_metrics': test_metrics,
+            'model_details': _get_model_details(global_best_model)
+        },
+        'performance_history': run_performance_history,
+        'run_stats': run_statistics,
+        'all_folds': all_fold_results
+    }
+
+    return all_fold_results, all_results, global_best_model
+
+
+# Helper Functions (to be implemented)
+def set_all_seeds(seed):
+    """Set all random seeds for reproducibility."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _safe_model_initialization(model_template, device, run_idx, fold_idx):
+    """Safely initialize model with error handling."""
+    model = copy.deepcopy(model_template).to(device)
+    model.train()
+    return model
+
+
+def _create_data_loaders(dataset, train_idx, val_idx, args):
+    """Create train and validation data loaders."""
+    train_loader = DataLoader(
+        Subset(dataset, train_idx),
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers
+    )
+    val_loader = DataLoader(
+        Subset(dataset, val_idx),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers
+    )
+    return train_loader, val_loader
+
+
+def _evaluate_fold(model, val_loader, device):
+    """Evaluate model on validation set."""
+    val_metrics = evaluate_model_2(
+        model,
+        lambda pred, target: model.compute_loss(pred, target),
+        val_loader,
+        device
+    )
+    return val_metrics
+
+
+def _save_run_best_model(model, save_dir, run_idx):
+    """Safely save run's best model."""
+    if model is not None and isinstance(model, torch.nn.Module):
+        save_path = os.path.join(
+            save_dir,
+            f"transfer_model_best_run_{run_idx + 1}.pth"
+        )
+        torch.save(model.state_dict(), save_path)
+        print(f"[保存] Current Run {run_idx + 1} Best Model => {save_path}")
+
+
+
+def predict_unlabeled_data(
+    new_data_path,
+    new_data_sheet,
+    metal_properties_sheet,
+    solvent_properties_sheet,
+    model_checkpoint_path,
+    pca_model_path,
+    args,
+    device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+):
+    """
+    使用已训练/迁移学习好的 GNN 模型，对无标签新数据进行推理预测，并处理 group_id 列。
+
+    - 如果新数据中无 group_id 列，则自动按 [SMILES, Solvent1, Solvent2, Solvent3, Solvent4] 进行分组并分配.
+    - 如果已有 group_id 列，则保留原样.
+    """
+
+    # 1) 读取新数据
+    new_df = pd.read_excel(new_data_path, sheet_name=new_data_sheet)
+
+    # 2) 确认并生成/保留 group_id
+    if "group_id" not in new_df.columns:
+        print("No 'group_id' column found in new data. Generating via assign_group_id_by_solvents...")
+        new_df = assign_group_id_by_solvents(new_df)
+    else:
+        print("Detected 'group_id' in new data. Keeping it for reference.")
+
+    # 3) 初始化与训练时一致的处理器并加载PCA模型
+    new_data_processor = MolecularDataProcessor(n_components=50)
+    pca_file = os.path.join(pca_model_path, f"{args.time}_{args.record}.pkl")
+    new_data_processor.load_pca_model(pca_file)
+
+    # 4) 计算指纹并进行PCA变换
+    new_fingerprints_raw = new_data_processor.compute_fingerprints(new_df)
+    new_fingerprints = new_data_processor.transform_fingerprints(new_fingerprints_raw)
+
+    # 5) 构建Dataset
+    unlabeled_dataset = process_data_with_fingerprints(
+        new_df,
+        metal_properties_sheet,
+        solvent_properties_sheet,
+        new_fingerprints,
+        augment=False,
+        data_split='test'
+    )
+
+    # 6) DataLoader
+    unlabeled_loader = DataLoader(
+        unlabeled_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=False,
+        persistent_workers=args.num_workers > 0
+    )
+
+    # 7) 加载训练好的模型
+    model = GNN(
+        node_features=unlabeled_dataset[0].x.size(1),
+        edge_features=unlabeled_dataset[0].edge_attr.size(1),
+        metal_features=unlabeled_dataset[0].metal_feats.size(1),
+        solvent_features=36,  # 与原训练时一致
+        hidden_dim=args.hidden_dim,
+        num_classes=4,        # 与原训练时一致
+        dropout_ratio=args.dropout_ratio
+    ).to(device)
+
+    # 加载每个折的模型并进行推理
+    all_preds = []
+    # 假设我们有多个模型，下面仅加载单个模型作为参考。
+    for checkpoint_path in model_checkpoint_path:  # 假设这是一个包含多个模型路径的列表
+        state_dict = torch.load(checkpoint_path, map_location='cpu')
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        with torch.no_grad():
+            for batch_data in unlabeled_loader:
+                batch_data = batch_data.to(device)
+                outputs = model(batch_data)
+                preds = outputs.argmax(dim=1).detach().cpu().numpy()
+                all_preds.extend(preds)
+
+    # 8) 合并预测结果，并保留 group_id
+    result_df = new_df.copy()
+    # 如果有多个模型的预测结果，可以进行平均或投票等进一步处理
+    result_df["prediction"] = all_preds
+
+    # 结果中就包含了 group_id、prediction 以及新数据的原始列
+    return result_df
+
+
+def stratified_sample_indices_imbalanced(labels: np.ndarray, per_class_config: dict = None, seed: int = 0):
+    """
+    针对严重不平衡数据的分层采样函数
+
+    Parameters:
+    -----------
+    labels : np.ndarray
+        标签数组
+    per_class_config : dict
+        每个类别的采样配置，例如 {0: 350, 1: 180, 2: 32, 3: 8}
+        如果为None，会根据您的数据分布自动设置
+    seed : int
+        随机种子
+    """
+
+    # 默认配置：根据您的实际数据分布设计
+    if per_class_config is None:
+        per_class_config = {
+            0: 350,  # 从3815中采样350，约9.2%
+            1: 180,  # 从1133中采样180，约15.9%
+            2: 32,  # 全部使用（稀有类）
+            3: 8  # 全部使用（极稀有类）
+        }
+
+    rng = np.random.RandomState(seed)
+    idx_list = []
+
+    print("🎯 执行不平衡数据分层采样...")
+    print("-" * 50)
+
+    for cls in np.unique(labels):
+        cls_idx = np.where(labels == cls)[0]
+
+        # 获取该类别的采样配置
+        if cls in per_class_config:
+            per_class = per_class_config[cls]
+        else:
+            per_class = min(100, len(cls_idx))  # 默认策略
+
+        if len(cls_idx) <= per_class:
+            # 稀有类全部保留
+            take = cls_idx
+            strategy = "全部使用(稀有类)"
+        else:
+            # 充足类别进行采样
+            take = rng.choice(cls_idx, per_class, replace=False)
+            strategy = f"随机采样({per_class}/{len(cls_idx)} = {per_class / len(cls_idx):.1%})"
+
+        idx_list.extend(take.tolist())
+
+        print(f"  类别{cls}: {len(take)} 个样本 - {strategy}")
+
+    rng.shuffle(idx_list)
+
+    print(f"\n📊 采样完成: 总计 {len(idx_list)} 个样本")
+    sampled_labels = labels[idx_list]
+    print(f"采样后分布: {dict(Counter(sampled_labels))}")
+    print("-" * 50)
+
+    return np.array(idx_list, dtype=np.int64)
+
+
+
+def extract_model_latent_representations_enhanced(
+        model,
+        data_loader,
+        device,
+        model_label,
+        max_samples=None,  # 改为None，提取所有数据
+        verbose=True
+):
+    """
+    增强版latent representations提取（提取更多数据）
+    """
+    model.eval()
+    latent_representations = []
+    sample_count = 0
+    total_batches = len(data_loader)
+
+    # Hook机制
+    intermediate_outputs = {}
+
+    def get_activation(name):
+        def hook(model, input, output):
+            if isinstance(output, tuple):
+                intermediate_outputs[name] = output[0].detach().cpu()
+            else:
+                intermediate_outputs[name] = output.detach().cpu()
+
+        return hook
+
+    hooks = []
+
+    # 注册hooks
+    if hasattr(model, 'fusion_layer'):
+        hook = model.fusion_layer.register_forward_hook(get_activation('fusion_output'))
+        hooks.append(hook)
+    elif hasattr(model, 'output_layer'):
+        hook = model.output_layer.register_forward_hook(get_activation('pre_output'))
+        hooks.append(hook)
+
+    if verbose:
+        print(f"🔄 提取 {model_label} 模型的 latent representations...")
+        print(f"   数据加载器总batch数: {total_batches}")
+
+    try:
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(data_loader):
+                if max_samples and sample_count >= max_samples:
+                    break
+
+                batch = batch.to(device)
+                intermediate_outputs.clear()
+
+                # 前向传播
+                _ = model(batch)
+
+                # 提取表示
+                batch_representations = None
+                if 'fusion_output' in intermediate_outputs:
+                    batch_representations = intermediate_outputs['fusion_output']
+                    if batch_representations.shape[1] == model.hidden_dim * 2:
+                        batch_representations = batch_representations[:, :model.hidden_dim]
+                elif 'pre_output' in intermediate_outputs:
+                    batch_representations = intermediate_outputs['pre_output']
+                else:
+                    # 备用方案
+                    batch_representations = extract_features_manually_enhanced(model, batch)
+
+                if batch_representations is not None:
+                    latent_representations.append(batch_representations.numpy())
+                    sample_count += len(batch_representations)
+
+                if verbose and (batch_idx + 1) % 5 == 0:
+                    print(f"   已处理 {batch_idx + 1}/{total_batches} 个batch，累计样本: {sample_count}")
+
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+    if latent_representations:
+        all_representations = np.vstack(latent_representations)
+        if verbose:
+            print(f"✅ 成功提取 {len(all_representations)} 个 {model_label} 样本的表示")
+            print(f"   表示维度: {all_representations.shape[1]}")
+        return all_representations
+    else:
+        if verbose:
+            print(f"❌ {model_label} 未提取到有效表示")
+        return None
+
+
+def extract_features_manually_enhanced(model, batch):
+    """增强版手动特征提取"""
+    try:
+        x, edge_index, batch_tensor = batch.x, batch.edge_index, batch.batch
+
+        # 图特征编码
+        graph_features = model.encoder(x, edge_index, batch_tensor)
+
+        # 金属特征处理
+        metal_feats = torch.nn.functional.dropout(
+            torch.nn.functional.relu(model.metal_fc(batch.metal_feats))
+        )
+
+        # 溶剂注意力
+        solvent_feats = model.solvent_attention(
+            batch.solvent1_feats, batch.solvent2_feats,
+            batch.solvent3_feats, batch.solvent4_feats
+        )
+
+        # 特征交互
+        interaction_features = graph_features * metal_feats
+
+        # 组合特征
+        combined_features = torch.cat([
+            graph_features,
+            metal_feats * model.metal_weight,
+            solvent_feats,
+            interaction_features
+        ], dim=1)
+
+        # 融合层
+        fused_features = model.fusion_layer(combined_features)
+
+        # 门控机制
+        main_path, gate_path = torch.split(fused_features, [model.hidden_dim, model.hidden_dim], dim=1)
+        gate = model.gate_layer(gate_path)
+        gated_features = main_path * gate
+
+        return gated_features.detach().cpu()
+
+    except Exception as e:
+        print(f"手动特征提取失败: {e}")
+        return None
+
+
+import os
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from sklearn.decomposition import PCA
+from scipy.stats import gaussian_kde
+
+# ==================== 全局字体设置 ====================
+mpl.rcParams['font.family'] = 'Times New Roman'
+mpl.rcParams['font.size'] = 13
+mpl.rcParams['axes.labelweight'] = 'bold'
+mpl.rcParams['axes.titleweight'] = 'bold'
+mpl.rcParams['legend.fontsize'] = 12
+mpl.rcParams['axes.titlesize'] = 15
+mpl.rcParams['axes.labelsize'] = 14
+
+
+def create_enhanced_latent_space_comparison(
+        pretrained_model_path: str,
+        finetuned_model_path: str,
+        data_loader,
+        model_template,
+        device,
+        output_dir: str,
+        filename_prefix: str = "enhanced_latent_comparison",
+        use_all_data: bool = True,
+        random_state: int = 42
+):
+    """
+    创建增强版 PCA latent space 对比（两个图单独输出，论文级可视化）
+    """
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("📂 加载模型并提取 latent representations...")
+    print(f"   使用所有数据: {use_all_data}")
+
+    # ==================== 创建模型实例 ====================
+    def create_model_instance():
+        return type(model_template)(
+            node_features=model_template.encoder.convs[0].in_channels
+            if hasattr(model_template.encoder, 'convs') else 128,
+            edge_features=3,
+            metal_features=model_template.metal_fc[0].in_features
+            if hasattr(model_template, 'metal_fc') else 64,
+            solvent_features=36,
+            hidden_dim=model_template.hidden_dim,
+            num_classes=4,
+            dropout_ratio=0.1
+        ).to(device)
+
+    print("   加载预训练模型...")
+    pretrained_model = create_model_instance()
+    pretrained_model.load_state_dict(
+        torch.load(pretrained_model_path, map_location=device),
+        strict=False
+    )
+
+    print("   加载微调模型...")
+    finetuned_model = create_model_instance()
+    finetuned_model.load_state_dict(
+        torch.load(finetuned_model_path, map_location=device),
+        strict=False
+    )
+
+    # ==================== 提取表示 ====================
+    max_samples = None if use_all_data else 1000
+
+    pretrained_representations = extract_model_latent_representations_enhanced(
+        pretrained_model, data_loader, device,
+        model_label="Pretrained", max_samples=max_samples, verbose=True
+    )
+
+    finetuned_representations = extract_model_latent_representations_enhanced(
+        finetuned_model, data_loader, device,
+        model_label="Finetuned", max_samples=max_samples, verbose=True
+    )
+
+    if pretrained_representations is None or finetuned_representations is None:
+        print("❌ 表示提取失败")
+        return None
+
+    # ==================== 对齐样本数 ====================
+    min_samples = min(len(pretrained_representations), len(finetuned_representations))
+    pretrained_representations = pretrained_representations[:min_samples]
+    finetuned_representations = finetuned_representations[:min_samples]
+
+    print(f"📊 样本统计: {min_samples}")
+
+    # ==================== PCA ====================
+    print("🔄 执行 PCA 降维...")
+    all_representations = np.vstack([pretrained_representations, finetuned_representations])
+    pca = PCA(n_components=2, random_state=random_state)
+    all_pca = pca.fit_transform(all_representations)
+
+    pretrained_pca = all_pca[:min_samples]
+    finetuned_pca = all_pca[min_samples:]
+
+    print(f"📊 PCA 方差解释率: {pca.explained_variance_ratio_.sum():.3f}")
+
+    # ==================== 图 1：散点图 ====================
+    print("🎨 绘制 PCA 散点图...")
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig1, ax1 = plt.subplots(figsize=(8, 7))
+
+    ax1.scatter(
+        pretrained_pca[:, 0], pretrained_pca[:, 1],
+        c='#FF6B6B', s=60, alpha=0.7,
+        edgecolors='white', linewidths=0.6,
+        label='Finetuned (with Pretrain)'
+    )
+
+    ax1.scatter(
+        finetuned_pca[:, 0], finetuned_pca[:, 1],
+        c='#4ECDC4', s=60, alpha=0.7,
+        edgecolors='white', linewidths=0.6,
+        label='Trained (without Pretrain)'
+    )
+
+    ax1.set_xlabel('PCA Dimension 1')
+    ax1.set_ylabel('PCA Dimension 2')
+    ax1.set_title('Latent Space Comparison (PCA)')
+    ax1.legend()
+    ax1.grid(alpha=0.3)
+
+    plt.tight_layout()
+    scatter_path = os.path.join(output_dir, f"{filename_prefix}_scatter.png")
+    plt.savefig(scatter_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+    # ==================== 图 2：密度图 ====================
+    print("🎨 绘制 PCA 密度分布图...")
+    fig2, ax2 = plt.subplots(figsize=(8, 7))
+
+    all_x = np.concatenate([pretrained_pca[:, 0], finetuned_pca[:, 0]])
+    all_y = np.concatenate([pretrained_pca[:, 1], finetuned_pca[:, 1]])
+
+    xx, yy = np.mgrid[
+        all_x.min()-1:all_x.max()+1:0.1,
+        all_y.min()-1:all_y.max()+1:0.1
+    ]
+    positions = np.vstack([xx.ravel(), yy.ravel()])
+
+    if len(pretrained_pca) > 1:
+        kde1 = gaussian_kde(pretrained_pca.T)
+        ax2.contour(xx, yy, kde1(positions).reshape(xx.shape),
+                    colors='#FF6B6B', levels=6, linewidths=1.5)
+
+    if len(finetuned_pca) > 1:
+        kde2 = gaussian_kde(finetuned_pca.T)
+        ax2.contour(xx, yy, kde2(positions).reshape(xx.shape),
+                    colors='#4ECDC4', levels=6, linewidths=1.5)
+
+    ax2.scatter(pretrained_pca[:, 0], pretrained_pca[:, 1],
+                c='#FF6B6B', alpha=0.4, s=30,
+                label='Finetuned (with Pretrain)')
+    ax2.scatter(finetuned_pca[:, 0], finetuned_pca[:, 1],
+                c='#4ECDC4', alpha=0.4, s=30,
+                label='Trained (without Pretrain)')
+
+    ax2.set_xlabel('PCA Dimension 1')
+    ax2.set_ylabel('PCA Dimension 2')
+    ax2.set_title('Latent Space Density Distribution')
+    ax2.legend()
+    ax2.grid(alpha=0.3)
+
+    plt.tight_layout()
+    density_path = os.path.join(output_dir, f"{filename_prefix}_density.png")
+    plt.savefig(density_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+    # ==================== Excel ====================
+    print("📊 导出 Excel 数据...")
+    excel_path = os.path.join(output_dir, f"{filename_prefix}_data.xlsx")
+
+    df = pd.DataFrame({
+        'PCA_1': np.concatenate([pretrained_pca[:, 0], finetuned_pca[:, 0]]),
+        'PCA_2': np.concatenate([pretrained_pca[:, 1], finetuned_pca[:, 1]]),
+        'Model': ['Finetuned (with Pretrain)'] * min_samples +
+                 ['Trained (without Pretrain)'] * min_samples
+    })
+
+    df.to_excel(excel_path, index=False)
+
+    print("✅ 结果已保存")
+    print(f"   📊 Excel: {excel_path}")
+    print(f"   🎨 Scatter: {scatter_path}")
+    print(f"   🎨 Density: {density_path}")
+
+    return {
+        'total_samples': min_samples,
+        'pca_explained_variance': pca.explained_variance_ratio_.tolist(),
+        'files': {
+            'excel': excel_path,
+            'scatter_plot': scatter_path,
+            'density_plot': density_path
+        }
+    }
+
+def run_fair_transfer_learning_comparison(args, transfer_data_loaders, base_model, device, t):
+    """
+    公平的迁移学习对比：两个模型都使用相同的交叉验证训练方法
+    """
+
+    print("\n🎯 公平的迁移学习对比实验")
+    print("   🔴 实验组: 预训练+微调模型 (使用kf_cross_validate)")
+    print("   🔵 对照组: 从头训练模型 (使用kf_cross_validate)")
+    print("   📊 训练方法: 完全相同，只有初始权重不同")
+
+    # ================== 准备相同的数据集 ==================
+    # 合并train和val作为full dataset（和预训练+微调模型一样）
+    full_train_val = transfer_data_loaders["train"].dataset + transfer_data_loaders["val"].dataset
+    test_loader = transfer_data_loaders["test"]
+
+    print(f"📊 数据准备:")
+    print(f"   训练+验证数据: {len(full_train_val)} 样本")
+    print(f"   测试数据: {sum(len(batch.y) for batch in test_loader)} 样本")
+
+    # ================== 路径设置 ==================
+    pretrained_finetuned_path = f"{args.fine_save}/{args.count}_{t}.pth"
+    from_scratch_path = f"{args.fine_save}/kf_from_scratch_{args.count}_{t}.pth"
+
+    # ================== 训练预训练+微调模型（如果不存在）==================
+    if not os.path.exists(pretrained_finetuned_path):
+        print("\n🔄 训练预训练+微调模型（使用交叉验证）...")
+
+        try:
+            fold_results_pretrained, all_results_pretrained, best_model_pretrained = kf_cross_validate_transfer_learning(
+                model_template=base_model,  # 🔴 已加载预训练权重
+                full_dataset=full_train_val,
+                test_loader=test_loader,
+                args=args,
+                device=device
+            )
+
+            torch.save(best_model_pretrained.state_dict(), pretrained_finetuned_path)
+            print(f"✅ 预训练+微调模型已保存: {pretrained_finetuned_path}")
+
+        except Exception as e:
+            print(f"❌ 预训练+微调训练失败: {e}")
+            return None
+    else:
+        print(f"✅ 预训练+微调模型已存在: {pretrained_finetuned_path}")
+
+    # ================== 训练从头开始模型（使用相同方法）==================
+    if not os.path.exists(from_scratch_path):
+        print("\n🔄 训练从头开始模型（使用相同的交叉验证）...")
+
+        try:
+            # 创建不加载预训练权重的模板模型
+            sample_data = next(iter(transfer_data_loaders["train"]))
+            from_scratch_template = GNN(
+                node_features=sample_data.x.size(1),
+                edge_features=sample_data.edge_attr.size(1),
+                metal_features=sample_data.metal_feats.size(1),
+                solvent_features=36,
+                hidden_dim=args.hidden_dim,
+                num_classes=4,
+                dropout_ratio=args.dropout_ratio
+            ).to(device)
+
+            # 🚨 关键：不加载预训练权重！保持随机初始化
+            print("🔵 使用随机初始化的模型进行交叉验证训练...")
+
+            fold_results_scratch, all_results_scratch, best_model_scratch = kf_cross_validate_transfer_learning(
+                model_template=from_scratch_template,  # 🔵 随机初始化模型
+                full_dataset=full_train_val,  # 🔄 相同数据
+                test_loader=test_loader,  # 🔄 相同测试集
+                args=args,  # 🔄 相同超参数
+                device=device  # 🔄 相同设备
+            )
+
+            torch.save(best_model_scratch.state_dict(), from_scratch_path)
+            print(f"✅ 从头训练模型已保存: {from_scratch_path}")
+
+            # 打印对比结果
+            print(f"\n📊 训练结果对比:")
+            if 'fold_results_pretrained' in locals():
+                print(f"   🔴 预训练+微调: {fold_results_pretrained}")
+            if 'fold_results_scratch' in locals():
+                print(f"   🔵 从头训练: {fold_results_scratch}")
+
+        except Exception as e:
+            print(f"❌ 从头训练失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    else:
+        print(f"✅ 从头训练模型已存在: {from_scratch_path}")
+
+    # ================== Latent Space对比（使用测试集）==================
+    print(f"\n🔬 使用测试集进行公平的Latent Space对比...")
+
+    try:
+        comparison_results = create_enhanced_latent_space_comparison(
+            pretrained_model_path=pretrained_finetuned_path,  # 🔴 预训练+微调(kf训练)
+            finetuned_model_path=from_scratch_path,  # 🔵 从头训练(kf训练)
+            data_loader=test_loader,  # 📊 测试集
+            model_template=base_model,
+            device=device,
+            output_dir=f"{args.output_dir}/fair_kf_comparison",
+            filename_prefix=f"fair_kf_pretrain_vs_scratch_{args.time}_{args.record}_{args.count}_{t}",
+            use_all_data=True,
+            random_state=42
+        )
+
+        if comparison_results:
+            print("✅ 公平的Latent Space对比完成！")
+            print(f"📊 结果保存在: {args.output_dir}/fair_kf_comparison/")
+            print("🎯 两个模型使用完全相同的训练方法，只有初始权重不同！")
+
+            return {
+                'pretrained_model_path': pretrained_finetuned_path,
+                'from_scratch_model_path': from_scratch_path,
+                'training_method': 'k-fold交叉验证',
+                'comparison_results': comparison_results
+            }
+
+    except Exception as e:
+        print(f"❌ 对比分析出错: {e}")
+        return None
+
+    return None
+def load_model_checkpoint(model, checkpoint_path, device, strict=True):
+    """
+    加载模型参数（支持严格/非严格）
+    """
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    print(f"Loading model parameters from: {checkpoint_path}")
+    state_dict = torch.load(checkpoint_path, map_location=device)
+
+    missing_keys, unexpected_keys = model.load_state_dict(
+        state_dict, strict=strict
+    )
+
+    if not strict:
+        print("⚠️ Non-strict loading enabled")
+        if missing_keys:
+            print("Missing keys:")
+            for k in missing_keys:
+                print(f"  - {k}")
+        if unexpected_keys:
+            print("Unexpected keys:")
+            for k in unexpected_keys:
+                print(f"  - {k}")
+
+    print("✅ Model parameters loaded successfully.")
+    return model
+
+def main():
+    parser = argparse.ArgumentParser(description="GNN for property prediction")
+    parser.add_argument("--data_path", type=str, default="/home/qyl/CSD_data/1_CSD/DATA_clean/output_deduped2.xlsx")
+    parser.add_argument("--sheet", type=str, default="sol_min5")
+    parser.add_argument("--source_batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--lr", type=float, default=0.0001)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--hidden_dim1", type=int, default=128)
+    parser.add_argument("--hidden_dim2", type=int, default=128)
+    parser.add_argument("--hidden_dim3", type=int, default=128)
+    parser.add_argument("--dropout_ratio", type=float, default=0.5)
+    parser.add_argument("--num_heads", type=int, default=4)
+    parser.add_argument("--transfer", type=str, default=True)
+    parser.add_argument("--transfer_sheet", type=str, default="unlabbeled2")
+    parser.add_argument("--transfer_data_path", type=str,
+                        default="/home/qyl/CSD_data/1_CSD/DATA_clean/output_deduped2.xlsx")
+    parser.add_argument("--tran_save", type=str, default="/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4")
+    parser.add_argument("--fine_save", type=str, default="/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4")
+    parser.add_argument("--output_dir", type=str, default="/home/qyl/CSD_data/1_CSD/DATA_clean/data_supp_going_rf")
+    parser.add_argument("--time", type=str, default="sol_min4_FF60")
+    parser.add_argument("--ori_arg", type=str, default=False)
+    parser.add_argument("--tran_arg", type=str, default=False)
+    parser.add_argument("--pca_model_path", type=str, default="/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4")
+    parser.add_argument("--hidden_dim", type=int, default=128)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--record", type=str, default="5")
+    parser.add_argument("--count", type=str, default="19111111111")
+    parser.add_argument("--cc", type=str, default="333")
+    parser.add_argument("--seed", type=int, default=42)
+
+    args = parser.parse_args()
+    num_classes = 4
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    seed = 42
+
+    # 初始化缓存管理器
+    cache_manager = DataCacheManager(cache_dir=f"{args.tran_save}/data_cache")
+
+    # 1. 数据加载和预处理
+    df = pd.read_excel(args.data_path, sheet_name=args.sheet)
+    metal_properties_sheet = pd.read_excel(args.data_path, 'metal')
+    solvent_properties_sheet = pd.read_excel(args.data_path, 'sol_pro4')
+
+    # ==================== 注释的源域训练部分 ====================
+
+    print(f"{args.time}:", args.time)
+
+    data_loaders, cache_manager, origin_data = create_data_loaders_with_cache(
+        args, df, metal_properties_sheet, solvent_properties_sheet,
+        cache_manager, force_reload=False
+    )
+
+    train_loader = data_loaders["train"]
+    val_loader = data_loaders["val"]
+    test_loader = data_loaders["test"]
+
+    # 5. 模型初始化
+    model = GNN(
+        node_features=origin_data["train"][0].x.size(1),
+        edge_features=origin_data["train"][0].edge_attr.size(1),
+        metal_features=origin_data["train"][0].metal_feats.size(1),
+        solvent_features=36,
+        hidden_dim=args.hidden_dim,
+        num_classes=num_classes,
+        dropout_ratio=args.dropout_ratio
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.75, patience=15, verbose=True
+    )
+
+    trained_model, best_train_results, best_val_results, best_test_results, _, _, _ = train_and_evaluate(
+        model,
+        optimizer,
+        scheduler,
+        lambda pred, target: model.compute_loss(pred, target),
+        data_loaders,
+        args.epochs,
+        device,
+        title="Origin_"
+    )
+
+    save_results_to_excel(
+        best_train_results, best_val_results, best_test_results,
+        args.output_dir,
+        f"source_domain_results{args.time}_seed{seed}_{args.record}_{args.count}.xlsx"
+    )
+
+    torch.save(
+        model.state_dict(),
+        f"{args.tran_save}/origin_model_state{args.time}_seed{seed}_{args.record}_{args.count}.pth"
+    )
+
+    # ==================== Transfer Learning 部分 ====================
+    if args.transfer:
+        # ================== Target Domain Data Preparation ==================
+        transfer_df = pd.read_excel(args.transfer_data_path, sheet_name=args.transfer_sheet)
+        transfer_data_processor = MolecularDataProcessor(n_components=50)
+        transfer_data_processor.load_pca_model(f"{args.pca_model_path}/{args.time}_{args.record}.pkl")
+
+        # t = random.randint(1, 10000)
+        # print("Random seed for transfer data:", t)
+        t = 42
+        # Prepare target domain datasets
+        (transfer_train_df, transfer_val_df, transfer_test_df), fingerprint_data = prepare_datasets(
+            transfer_df, transfer_data_processor, test_size=0.4, random_state=t, is_training=False
+        )
+
+        augment = False
+        print("Augment:", augment)
+
+        # Process data with fingerprints
+        transfer_train = process_data_with_fingerprints(
+            transfer_train_df, metal_properties_sheet, solvent_properties_sheet,
+            fingerprint_data[0], augment=augment, data_split='train'
+        )
+        transfer_val = process_data_with_fingerprints(
+            transfer_val_df, metal_properties_sheet, solvent_properties_sheet,
+            fingerprint_data[1], augment=False, data_split='val'
+        )
+        transfer_test = process_data_with_fingerprints(
+            transfer_test_df, metal_properties_sheet, solvent_properties_sheet,
+            fingerprint_data[2], augment=False, data_split='test'
+        )
+
+        # ================== Data Loaders Preparation ==================
+        train_dataset = transfer_train
+        if args.tran_arg:
+            train_dataset = flexible_augment_data(
+                transfer_train, max_augmentations=1, augmentation_probability=1
+            )
+
+        transfer_data_loaders = {
+            "train": DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                                num_workers=args.num_workers, pin_memory=False,
+                                persistent_workers=args.num_workers > 0),
+            "val": DataLoader(transfer_val, batch_size=args.batch_size, shuffle=False,
+                              num_workers=args.num_workers, pin_memory=False, persistent_workers=args.num_workers > 0),
+            "test": DataLoader(transfer_test, batch_size=args.batch_size, shuffle=False,
+                               num_workers=args.num_workers, pin_memory=False, persistent_workers=args.num_workers > 0)
+        }
+
+        # ================== Transfer Learning Model Setup ==================
+        base_model = GNN(
+            node_features=transfer_train[0].x.size(1),
+            edge_features=transfer_train[0].edge_attr.size(1),
+            metal_features=transfer_train[0].metal_feats.size(1),
+            solvent_features=36,
+            hidden_dim=args.hidden_dim,
+            num_classes=num_classes,
+            dropout_ratio=args.dropout_ratio
+        ).to(device)
+
+        state_dict = torch.load(f"{args.tran_save}/origin_model_state{args.time}_3.23_{args.record}.pth",
+                                map_location='cpu')
+        base_model.load_state_dict(state_dict, strict=False)
+
+        # 冻结特定层
+        def freeze_transfer_layers(model):
+            components_to_freeze = ['graph_encoder', 'metal_net', 'solvent_attn']
+            model.freeze_components(components_to_freeze)
+
+        freeze_transfer_layers(base_model)
+
+        # ================== Enhanced Cross Validation ==================
+        full_train_val = transfer_train + transfer_val
+        print("\n=== Data Sanity Check ===")
+        print(f"Full dataset size: {len(full_train_val)}")
+        print(f"Test loader size: {len(transfer_data_loaders['test'].dataset)}")
+
+        fold_results, all_results, best_model = kf_cross_validate_transfer_learning(
+            model_template=base_model,
+            full_dataset=full_train_val,
+            test_loader=transfer_data_loaders["test"],
+            args=args,
+            device=device
+        )
+
+        # Save best model
+        torch.save(
+            best_model.state_dict(),
+            f"{args.fine_save}/{args.count}_{t}.pth"
+        )
+        print(f"Saved best model to {args.fine_save}/{args.count}_{t}.pth")
+        print("\n🚀 开始公平的迁移学习对比（相同交叉验证方法）...")
+        try:
+            fair_comparison_results = run_fair_transfer_learning_comparison(
+                args, transfer_data_loaders, base_model, device, t
+            )
+
+            if fair_comparison_results:
+                print("✅ 公平对比完成！")
+                print("🎯 关键优势:")
+                print("   - 两个模型使用相同的k-fold交叉验证训练")
+                print("   - 相同的数据分割和超参数")
+                print("   - 唯一差异：是否使用预训练权重")
+                print("   - 结果更科学可信！")
+
+        except Exception as e:
+            print(f"❌ 公平对比失败: {e}")
+
+        # ==================== 原有的预测部分 ====================
+        # 预测新数据
+        new_data_pred_df = predict_unlabeled_data(
+            new_data_path="/home/qyl/CSD_data/1_CSD/DATA_clean/output_deduped2.xlsx",
+            new_data_sheet="unlabbeled2",
+            metal_properties_sheet=metal_properties_sheet,
+            solvent_properties_sheet=solvent_properties_sheet,
+            model_checkpoint_path=[
+                f"{args.fine_save}/{args.count}_{t}.pth"
+            ],  # 包含了训练得到的最佳模型
+            pca_model_path=args.pca_model_path,
+            args=args,
+            device=device
+        )
+
+        # 将结果另存为Excel
+        output_path = f"/home/qyl/CSD_data/1_CSD/DATA_clean/pre_{args.count}_{t}_6_1.xlsx"
+        new_data_pred_df.to_excel(output_path, index=False)
+        print(f"预测完成，结果已保存到 {output_path}")
+
+        # 保存训练集、验证集和测试集的结果
+        result_dict = {
+            "Train": transfer_train_df.assign(prediction=None),  # 添加空预测列
+            "Validation": transfer_val_df.assign(prediction=None),  # 添加空预测列
+            "Test": transfer_test_df.assign(prediction=None)  # 添加空预测列
+        }
+
+        # 将预测结果（若有的话）写入对应的 DataFrame 中
+        if 'prediction' in new_data_pred_df.columns:
+            result_dict["Test"]["prediction"] = new_data_pred_df["prediction"]
+
+
+            # 将所有结果保存到一个 Excel 文件中
+        with pd.ExcelWriter(f"/home/qyl/CSD_data/1_CSD/DATA_clean/results_{args.count}_{t}_6_1.xlsx") as writer:
+            for name, result_df in result_dict.items():
+                result_df.to_excel(writer, sheet_name=name, index=False)
+
+        print(f"训练集、验证集和测试集的结果已保存到 /home/qyl/CSD_data/1_CSD/DATA_clean/results_{args.count}_{t}_6_1.xlsx")
+
+
+if __name__ == "__main__":
+    main()
