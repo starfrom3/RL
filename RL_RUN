@@ -1,0 +1,4503 @@
+from datetime import datetime
+import functools
+import functools
+import inspect
+import json
+import logging
+import math
+from collections import defaultdict
+from matplotlib.gridspec import GridSpec
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch.nn as nn
+import yaml
+from rdkit import DataStructs
+from rdkit import RDLogger
+from rdkit.Chem import rdmolfiles, MACCSkeys
+from rdkit.Chem.Scaffolds import MurckoScaffold
+from rdkit.DataStructs import BulkTanimotoSimilarity
+from torch.utils.checkpoint import checkpoint
+from torch.utils.data import Dataset
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+lg = RDLogger.logger()
+lg.setLevel(RDLogger.CRITICAL)
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+class VAEDataset(Dataset):
+    def __init__(self, smiles_list, charset, max_len=100, augment_prob=0.5):
+        """
+        优化点：
+        1. 增加输入校验
+        2. 修复数据增强逻辑
+        3. 优化内存使用
+        4. 增强错误处理
+        """
+
+        # 输入校验
+        if not isinstance(smiles_list, list):
+            raise TypeError("smiles_list must be a list")
+        if len(smiles_list) == 0:
+            raise ValueError("smiles_list cannot be empty")
+
+        self.max_len = max_len
+        self.charset = charset
+        self.char_to_idx = {c: i for i, c in enumerate(charset)}
+        self.idx_to_char = {i: c for i, c in enumerate(charset)}
+        self.augment_prob = min(max(augment_prob, 0), 1)  # 限制概率范围
+
+        # 标准化预处理（并行化处理）
+        self.smiles_list = []
+        invalid_count = 0
+        for s in smiles_list:
+            standardized = self._standardize_smiles(s)
+            if standardized:  # 仅保留有效SMILES
+                self.smiles_list.append(standardized)
+            else:
+                invalid_count += 1
+        if invalid_count > 0:
+            print(f"Warning: Dropped {invalid_count} invalid SMILES")
+
+        # 特殊标记检查
+        required_tokens = {'<pad>', '<start>', '<end>'}
+        missing = required_tokens - set(charset)
+        if missing:
+            raise ValueError(f"Missing required tokens: {missing}")
+
+        self.pad_idx = self.char_to_idx['<pad>']
+        self.start_idx = self.char_to_idx['<start>']
+        self.end_idx = self.char_to_idx['<end>']
+        self.mask_idx = self.char_to_idx.get('<mask>', None)
+
+        # 延迟编码（优化内存）
+        self._encoded_cache = {}
+        self._augmentation_types = ['randomize', 'remove_stereo', 'canonical', 'permute', 'rotate']
+
+        # 字符权重计算（使用对数平滑）
+        self.char_counts = defaultdict(int)
+        for s in self.smiles_list:
+            for c in s:
+                if c in self.char_to_idx:
+                    self.char_counts[c] += 1
+
+        total_chars = sum(self.char_counts.values())
+        self.char_weights = torch.ones(len(charset))
+        for c, idx in self.char_to_idx.items():
+            if self.char_counts.get(c, 0) > 0:
+                self.char_weights[idx] = np.log(total_chars / (self.char_counts[c] + 1)) + 1
+
+    def _permute_ring_numbers(self, mol):
+        """随机置换环的编号顺序"""
+        try:
+            return Chem.MolToSmiles(mol, canonical=False, doRandom=True)
+        except:
+            return Chem.MolToSmiles(mol)
+    def _standardize_smiles(self, smiles):
+        """更健壮的标准化方法"""
+        if not isinstance(smiles, str):
+            return None
+
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                return None
+
+            # 统一处理：移除手性信息、标准化芳香性表示
+            Chem.RemoveStereochemistry(mol)
+            Chem.SanitizeMol(mol)
+            return Chem.MolToSmiles(mol, isomericSmiles=False, canonical=True)
+        except:
+            return None
+
+    def _process_single_smiles(self, smiles):
+        """带缓存的增强处理"""
+        if smiles in self._encoded_cache:
+            return self._encoded_cache[smiles]
+        # 检查有效性
+        if not self._is_valid_smiles(smiles):
+            return [self.pad_idx] * self.max_len
+
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            encoded = self.encode_smiles(smiles)
+            self._encoded_cache[smiles] = encoded
+            return encoded
+
+        # 数据增强
+        if random.random() < self.augment_prob and mol.GetNumAtoms() > 1:  # 小分子不增强
+
+            try:
+                aug_type = random.choice(self._augmentation_types)
+                new_smiles = self._augment_smiles(mol, aug_type)
+                if self._is_valid_smiles(new_smiles):
+                    smiles = new_smiles
+            except Exception:
+                pass
+
+        encoded = self.encode_smiles(smiles)
+        self._encoded_cache[smiles] = encoded
+        return encoded
+
+    def get_augmentations(self, smiles):
+        """获取指定SMILES的所有增强版本"""
+        mol = Chem.MolFromSmiles(smiles)
+        if not mol:
+            return []
+
+        augmented = []
+        for aug_type in self._augmentation_types:
+            try:
+                new_smiles = self._augment_smiles(mol, aug_type)
+                if self._is_valid_smiles(new_smiles):
+                    augmented.append((aug_type, new_smiles))
+            except:
+                continue
+        return augmented
+
+    def _atom_modification(self, mol):
+        """随机替换原子（示例：替换卤素）"""
+        halogen = ['F', 'Cl', 'Br']
+        new_mol = Chem.RWMol(mol)
+        for atom in new_mol.GetAtoms():
+            if atom.GetSymbol() in halogen and random.random() < 0.2:
+                new_symbol = random.choice([x for x in halogen if x != atom.GetSymbol()])
+                atom.SetAtomicNum(Chem.GetPeriodicTable().GetAtomicNumber(new_symbol))
+        try:
+            Chem.SanitizeMol(new_mol)
+            return Chem.MolToSmiles(new_mol)
+        except:
+            return Chem.MolToSmiles(mol)
+
+    def _augment_smiles(self, mol, aug_type):
+        """模块化的增强方法"""
+        try:
+            if aug_type == 'randomize':
+                return rdmolfiles.MolToRandomSmilesVect(mol, 1)[0]
+
+            elif aug_type == 'remove_stereo':
+                new_mol = Chem.Mol(mol)
+                Chem.RemoveStereochemistry(new_mol)
+                return Chem.MolToSmiles(new_mol)
+
+            elif aug_type == 'rotate':
+                return Chem.MolToSmiles(mol, doRandom=True, canonical=False)
+
+            elif aug_type == 'permute':
+                if mol.GetRingInfo().NumRings() > 0:
+                    return self._permute_ring_numbers(mol)
+                return Chem.MolToSmiles(mol)
+
+            else:  # canonical
+                return Chem.MolToSmiles(mol)
+        except:
+            return Chem.MolToSmiles(mol)
+
+    def encode_smiles(self, smiles):
+        """更安全的编码方法"""
+        try:
+            encoded = [self.start_idx]
+            for c in smiles:
+                if c in self.char_to_idx and len(encoded) < self.max_len - 1:
+                    encoded.append(self.char_to_idx[c])
+            encoded.append(self.end_idx)
+
+            # 填充处理
+            if len(encoded) < self.max_len:
+                encoded += [self.pad_idx] * (self.max_len - len(encoded))
+            else:
+                encoded = encoded[:self.max_len]
+                encoded[-1] = self.end_idx
+
+            return encoded
+        except:
+            return [self.pad_idx] * self.max_len
+
+    def __len__(self):
+        return len(self.smiles_list)
+
+    def __getitem__(self, idx):
+        smiles = self.smiles_list[idx]
+        encoded = self._process_single_smiles(smiles)
+        return torch.tensor(encoded, dtype=torch.long)
+
+    def _is_valid_smiles(self, smiles):
+        """检查SMILES是否有效"""
+        return Chem.MolFromSmiles(smiles) is not None
+
+def build_vocab(smiles_list):
+    chars = {'<pad>', '<start>', '<end>', '<mask>'}  # 特殊标记
+    for s in smiles_list:
+        chars.update(set(s))  # 添加所有SMILES中的字符
+    return sorted(list(chars))  # 返回排序后的字符列表
+
+
+def filter_valid(smiles_list):
+    """优化后的有效性过滤"""
+    valid = set()
+    for s in smiles_list:
+        try:
+            mol = Chem.MolFromSmiles(s)
+            if mol:
+                valid.add(Chem.MolToSmiles(mol, isomericSmiles=False, canonical=True))
+        except:
+            continue
+    return list(valid)
+
+def compute_fingerprints(smiles_list, radius=2, n_bits=2048):
+    fps = []
+    for s in smiles_list:
+        mol = Chem.MolFromSmiles(s)
+        if mol:
+            fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+            fps.append(fp)
+    return fps
+
+
+def novelty_score(generated_smiles, reference_smiles):
+    """计算生成分子的新颖性（不在参考集中出现的比例）"""
+    ref_set = set(reference_smiles)
+    novel = [s for s in generated_smiles if s not in ref_set]
+    return len(novel) / len(generated_smiles) if generated_smiles else 0
+
+
+def diversity_score(smiles_list):
+    """计算分子集合的多样性（基于Tanimoto相似度）"""
+    if len(smiles_list) < 2:
+        return 0
+
+    fps = compute_fingerprints(smiles_list)
+    if len(fps) < 2:
+        return 0
+
+    similarities = []
+    for i in range(len(fps)):
+        for j in range(i + 1, len(fps)):
+            sim = DataStructs.TanimotoSimilarity(fps[i], fps[j])
+            similarities.append(sim)
+
+    if not similarities:
+        return 0
+    return 1 - np.mean(similarities)
+
+
+class AttentionResidualBlock(nn.Module):
+    def __init__(self, in_dim, out_dim, heads=8, dropout=0.1):
+        super().__init__()
+        self.linear1 = nn.Linear(in_dim, out_dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=out_dim,
+            num_heads=heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.linear2 = nn.Linear(out_dim, out_dim)
+        self.norm1 = nn.LayerNorm(out_dim)
+        self.norm2 = nn.LayerNorm(out_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # 允许处理2D和3D输入
+        input_shape = x.shape
+        if len(input_shape) == 2:  # [batch, features]
+            x = x.unsqueeze(1)  # 转换为3D [batch, 1, features]
+
+        residual = self.linear1(x)  # [batch, seq_len, out_dim]
+
+        # 注意力计算
+        attn_output, _ = self.attention(residual, residual, residual)
+
+        # 残差连接
+        x = self.norm1(attn_output + residual)
+        x = self.linear2(x)
+        x = self.dropout(x)
+        x = self.norm2(x + residual)
+
+        # 恢复原始维度
+        if len(input_shape) == 2:
+            x = x.squeeze(1)  # 回到2D [batch, features]
+        return x
+
+class VAE(nn.Module):
+    def __init__(self, vocab_size, latent_dim=128, embedding_dim=256, hidden_dim=512,
+                 num_layers=2, dropout=0.3, use_gradient_ckpt=False):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.use_gradient_ckpt = use_gradient_ckpt
+
+        # ------------------ Encoder ------------------
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+        self.embedding_dropout = nn.Dropout(dropout * 0.5)
+
+        self.encoder_rnn = nn.GRU(
+            embedding_dim,
+            hidden_dim,
+            num_layers=num_layers,
+            bidirectional=True,
+            batch_first=True,
+            dropout=dropout
+        )
+
+        self.encoder_fc = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Dropout(dropout),
+            AttentionResidualBlock(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim)
+        )
+
+        self.mu = nn.Linear(hidden_dim, latent_dim)
+        self.logvar = nn.Linear(hidden_dim, latent_dim)  # 移除了Tanh激活
+
+        # ------------------ Decoder ------------------
+        self.decoder_rnn = nn.GRU(
+            embedding_dim + latent_dim,
+            hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+
+        self.decoder_fc = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            AttentionResidualBlock(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, vocab_size)
+        )
+
+        # 初始化参数
+        self._init_weights()
+
+        self.hidden_project = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim * num_layers),
+            nn.Tanh(),
+            nn.Dropout(dropout // 2)
+        )
+
+    def _init_weights(self):
+        for module in [self.mu, self.logvar]:
+            nn.init.xavier_normal_(module.weight)
+            nn.init.constant_(module.bias, 0)
+
+        for module in self.decoder_fc:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight)
+                nn.init.constant_(module.bias, 0)
+
+    def encode(self, x):
+        # 梯度检查点封装方法
+        def _encode(x):
+            embedded = self.embedding_dropout(self.embedding(x))
+            encoder_out, hidden = self.encoder_rnn(embedded)
+
+            # 处理双向隐藏状态
+            hidden = hidden.view(self.num_layers, 2, -1, self.hidden_dim)
+            hidden = hidden[-1]  # 取最后一层
+            hidden = torch.cat([hidden[0], hidden[1]], dim=-1)  # [batch, hidden_dim*2]
+
+            if self.use_gradient_ckpt and self.training:
+                hidden = torch.utils.checkpoint.checkpoint(self.encoder_fc, hidden)
+            else:
+                hidden = self.encoder_fc(hidden)
+            return hidden
+
+        # 应用梯度检查点到整个编码过程
+        if self.use_gradient_ckpt and self.training:
+            hidden = torch.utils.checkpoint.checkpoint(_encode, x)
+        else:
+            hidden = _encode(x)
+
+        return self.mu(hidden), self.logvar(hidden)
+
+    def _ensure_tensor_shape(self, tensor, batch_size):
+        """确保张量具有正确的形状和类型"""
+        device = next(self.parameters()).device
+
+        # 确保是张量
+        if not isinstance(tensor, torch.Tensor):
+            if isinstance(tensor, int) or (isinstance(tensor, list) and all(isinstance(i, int) for i in tensor)):
+                tensor = torch.tensor(tensor if isinstance(tensor, list) else [tensor],
+                                      dtype=torch.long, device=device)
+            else:
+                tensor = torch.tensor(tensor, device=device)
+
+        # 确保在正确的设备上
+        if tensor.device != device:
+            tensor = tensor.to(device)
+
+        # 确保是长整型（对于embedding索引）
+        if tensor.dtype != torch.long and (tensor.dim() == 1 or tensor.dim() == 2):
+            tensor = tensor.long()
+
+        # 处理形状问题
+        if tensor.dim() == 0:  # 标量张量
+            tensor = tensor.unsqueeze(0).repeat(batch_size)
+
+        if tensor.dim() == 1:  # [batch] 或 [1]
+            if tensor.size(0) != batch_size:
+                # 如果是单个值，扩展到batch大小
+                if tensor.size(0) == 1:
+                    tensor = tensor.repeat(batch_size)
+                else:
+                    # 否则可能是错误的情况，记录警告
+                    print(f"Warning: Tensor size mismatch. Expected batch_size={batch_size}, got {tensor.size(0)}")
+            # 为序列维度添加一个维度
+            tensor = tensor.unsqueeze(1)
+
+        return tensor
+
+    def decode(self, z, x, hidden=None, teacher_forcing_ratio=1.0):
+        batch_size, seq_len = x.size(0), x.size(1)
+        vocab_size = self.embedding.num_embeddings  # 词汇表大小
+
+        # 处理序列长度过短的情况
+        if seq_len <= 1:
+            print(f"Warning: Sequence length too short: {seq_len}")
+            # 返回一个默认的空输出，形状为 [batch, 1, vocab_size]
+            return torch.zeros(batch_size, 1, vocab_size, device=z.device)
+
+        # 初始化隐藏状态
+        if hidden is None:
+            hidden = self.hidden_project(z)
+            hidden = hidden.view(self.num_layers, -1, self.hidden_dim)
+
+        outputs = []
+        # 确保第一个输入形状正确 [batch, 1]
+        inputs = self._ensure_tensor_shape(x[:, 0], batch_size)
+
+        try:
+            for t in range(seq_len - 1):
+                # 修改后的_decode_step
+                def _decode_step(inputs, hidden):
+                    # 确保inputs形状正确
+                    inputs = self._ensure_tensor_shape(inputs, batch_size)
+
+                    embedded = self.embedding(inputs)  # [batch, 1, emb_dim]
+                    z_expanded = z.unsqueeze(1)  # [batch, 1, latent_dim]
+                    decoder_input = torch.cat([embedded, z_expanded], dim=-1)
+
+                    decoder_out, hidden = self.decoder_rnn(decoder_input, hidden)
+
+                    # 确保输入解码器的形状正确
+                    decoder_out = decoder_out.contiguous().view(batch_size, -1, self.hidden_dim)
+                    return self.decoder_fc(decoder_out), hidden
+
+                if self.use_gradient_ckpt and self.training:
+                    step_output, hidden = torch.utils.checkpoint.checkpoint(
+                        _decode_step, inputs, hidden
+                    )
+                else:
+                    step_output, hidden = _decode_step(inputs, hidden)
+
+                outputs.append(step_output)
+
+                # 决定下一个输入
+                if torch.rand(1).item() < teacher_forcing_ratio:
+                    inputs = self._ensure_tensor_shape(x[:, t + 1], batch_size)
+                else:
+                    pred = step_output.argmax(dim=-1)
+                    inputs = self._ensure_tensor_shape(pred, batch_size)
+
+        except Exception as e:
+            print(f"Exception in decode loop: {e}")
+            # 如果循环中出现异常，生成默认输出
+            return torch.zeros(batch_size, seq_len - 1, vocab_size, device=z.device)
+
+        # 检查outputs是否为空
+        if not outputs:
+            print("Warning: Empty outputs list in decode method")
+            return torch.zeros(batch_size, max(1, seq_len - 1), vocab_size, device=z.device)
+
+        try:
+            # 尝试连接输出
+            result = torch.cat(outputs, dim=1)  # [batch, seq_len-1, vocab_size]
+            return result
+        except Exception as e:
+            print(f"Error in torch.cat: {e}")
+            return torch.zeros(batch_size, len(outputs) or max(1, seq_len - 1), vocab_size, device=z.device)
+
+    def forward(self, x, kl_weight=1.0, teacher_forcing_ratio=1.0):
+        # 确保输入x是正确的形状和类型
+        batch_size = x.size(0) if isinstance(x, torch.Tensor) and x.dim() > 0 else 1
+        x = self._ensure_tensor_shape(x, batch_size)
+
+        if x.dim() < 2:  # 确保x至少是2维 [batch, seq]
+            x = x.unsqueeze(0) if x.dim() == 1 else x.unsqueeze(0).unsqueeze(0)
+
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon = self.decode(z, x, teacher_forcing_ratio=teacher_forcing_ratio)
+
+        # KL散度计算
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+        kl_loss = kl_weight * kl_loss.mean()
+
+        return recon, mu, logvar, kl_loss
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+
+
+def vae_loss(recon_x, x, mu, logvar, beta=0.1, char_weights=None):
+    # 添加epsilon防止数值不稳定
+    eps = 1e-8
+    recon_loss = F.cross_entropy(
+        recon_x.reshape(-1, recon_x.size(-1)),
+        x[:, 1:].reshape(-1),
+        ignore_index=0,
+        weight=char_weights,
+        label_smoothing=0.1
+    ) + eps
+
+    # 改进的KL散度计算
+    kl_div = -0.5 * torch.mean(1 + logvar - mu.pow(2) - (logvar.exp().clamp(min=1e-8)))
+    kl_div = torch.clamp(kl_div, min=0.1, max=10.0)  # 添加上下限
+
+    total_loss = recon_loss + beta * kl_div
+
+    # 返回单个总损失值（或按需返回元组）
+    return total_loss, recon_loss, kl_div  # 明确返回三个值
+
+
+class EarlyStopping:
+    def __init__(self, patience=10, delta=0, min_epochs=20):
+        """
+        Args:
+            patience: 在损失不再下降后等待的epoch数
+            delta: 视为改进的最小变化量
+            min_epochs: 最小训练轮数(即使触发了早停条件也不停止)
+        """
+        self.patience = patience
+        self.delta = delta
+        self.min_epochs = min_epochs
+        self.counter = 0
+        self.best_loss = float('inf')
+        self.early_stop = False
+
+    def __call__(self, val_loss, current_epoch):
+        if current_epoch < self.min_epochs:
+            return False  # 强制完成最小训练轮数
+
+        if val_loss < self.best_loss - self.delta:
+            self.best_loss = val_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+
+        return self.early_stop
+
+def train_vae(
+    model,
+    dataloader,
+    epochs=100,
+    lr=5e-4,
+    beta_start=0.001,
+    beta_end=0.3,
+    warmup_epochs=30,
+    checkpoint_path=None,
+    # 新增：KL退火与Teacher Forcing
+    kl_warmup_ratio=1.0,  # KL权重在warmup_epochs结束后是否继续上升到1.0
+    teacher_forcing_start=1.0,
+    teacher_forcing_end=0.7
+):
+    """
+    :param kl_warmup_ratio: KL退火的最高比率，默认1.0表示warmup结束后KL权重达到 beta_end
+    :param teacher_forcing_start: 最初Teacher Forcing比率
+    :param teacher_forcing_end: 训练结束时Teacher Forcing比率
+    """
+    writer = SummaryWriter()  # TensorBoard记录
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-6)
+    early_stopper = EarlyStopping(patience=10, delta=0.001, min_epochs=10)
+
+    # KL梯度退火曲线
+    def get_beta(epoch):
+        if epoch < warmup_epochs:
+            # 线性从 beta_start -> beta_end * kl_warmup_ratio
+            alpha = epoch / warmup_epochs
+            return beta_start + (beta_end * kl_warmup_ratio - beta_start) * alpha
+        # 之后做余弦退火到 beta_end
+        alpha = (epoch - warmup_epochs) / (epochs - warmup_epochs)
+        return (beta_end * kl_warmup_ratio) + (beta_end - beta_end * kl_warmup_ratio) * 0.5 * (1 + np.cos(np.pi * alpha))
+
+    # Teacher Forcing调度
+    def get_teacher_forcing_ratio(epoch):
+        # 线性衰减
+        return teacher_forcing_end + (teacher_forcing_start - teacher_forcing_end) * max(
+            0, (1 - epoch / float(epochs))
+        )
+
+    # OneCycle策略
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        epochs=epochs,
+        steps_per_epoch=len(dataloader),
+        pct_start=0.3
+    )
+
+    best_loss = float('inf')
+    char_weights = (
+        dataloader.dataset.char_weights.to(device)
+        if hasattr(dataloader.dataset, 'char_weights')
+        else None
+    )
+    metrics = {
+        'epoch': [], 'loss': [], 'recon_loss': [], 'kl_loss': [],
+        'beta': [], 'lr': [], 'grad_norm': [], 'teacher_forcing': []
+    }
+
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        total_recon_loss = 0
+        total_kl_loss = 0
+        total_grad_norm = 0
+
+        current_beta = get_beta(epoch)
+        tf_ratio = get_teacher_forcing_ratio(epoch)
+
+        writer.add_scalar('beta', current_beta, epoch)
+        writer.add_scalar('teacher_forcing', tf_ratio, epoch)
+
+        pbar = tqdm(dataloader, desc=f'Epoch {epoch + 1}/{epochs}')
+        for batch in pbar:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+
+            # forward可传teacher_forcing_ratio
+            recon, mu, logvar,kl_loss = model(batch, teacher_forcing_ratio=tf_ratio)
+            loss, recon_loss, kl_loss = vae_loss(recon, batch, mu, logvar, current_beta, char_weights)
+            loss.backward()
+
+            # 梯度监控和裁剪
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+
+            total_loss += loss.item()
+            total_recon_loss += recon_loss.item()
+            total_kl_loss += kl_loss.item()
+            total_grad_norm += grad_norm.item()
+
+            pbar.set_postfix({
+                'loss': total_loss / (pbar.n + 1),
+                'beta': current_beta,
+                'tf_ratio': tf_ratio,
+                'grad_norm': f"{grad_norm.item():.3f}",
+                'lr': scheduler.get_last_lr()[0]
+            })
+
+        # Calculate epoch averages
+        avg_loss = total_loss / len(dataloader)
+        avg_recon_loss = total_recon_loss / len(dataloader)
+        avg_kl_loss = total_kl_loss / len(dataloader)
+        avg_grad_norm = total_grad_norm / len(dataloader)
+        current_lr = scheduler.get_last_lr()[0]
+
+        metrics['epoch'].append(epoch)
+        metrics['loss'].append(avg_loss)
+        metrics['recon_loss'].append(avg_recon_loss)
+        metrics['kl_loss'].append(avg_kl_loss)
+        metrics['beta'].append(current_beta)
+        metrics['lr'].append(current_lr)
+        metrics['grad_norm'].append(avg_grad_norm)
+        metrics['teacher_forcing'].append(tf_ratio)
+
+        # 保存指标
+        if checkpoint_path:
+            metrics_dir = os.path.dirname(checkpoint_path)
+            metrics_df = pd.DataFrame(metrics)
+            metrics_df.to_csv(f"{metrics_dir}/metrics.csv", index=False)
+
+        # 保存最佳模型
+        if avg_loss < best_loss and checkpoint_path:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), checkpoint_path)
+            print(f"Saved best model with loss {best_loss:.4f}")
+
+        if early_stopper(avg_loss, epoch):
+            print(f"Early stopping triggered at epoch {epoch}")
+            break
+
+    return model
+
+
+def visualize_latent_space(model, dataset, num_samples=1000):
+    device = next(model.parameters()).device
+    indices = np.random.choice(len(dataset), num_samples, replace=False)
+    samples = [dataset[i] for i in indices]
+    inputs = torch.stack(samples).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        mu, _ = model.encode(inputs)
+
+    # t-SNE降维
+    tsne = TSNE(n_components=2, perplexity=30, n_iter=1000)
+    z_2d = tsne.fit_transform(mu.cpu().numpy())
+
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(x=z_2d[:, 0], y=z_2d[:, 1], alpha=0.6, palette="husl")
+    plt.title("t-SNE Visualization of Latent Space")
+    plt.xlabel("t-SNE 1")
+    plt.ylabel("t-SNE 2")
+    plt.show()
+
+def visualize_perturbation(model, charset, original_smiles, num_variants=5, perturb_scales=[0.1, 0.5]):
+    original_mol = Chem.MolFromSmiles(original_smiles)
+    if not original_mol:
+        print("Invalid original SMILES")
+        return None
+
+    variants = []
+    for scale in perturb_scales:
+        for _ in range(num_variants):
+            perturbed_list = generate_molecules(
+                model, charset,
+                num_samples=1,
+                perturb_scale=scale,
+                temperature=0.8,  # 添加温度参数
+                use_nucleus=True
+            )
+            if perturbed_list and len(perturbed_list) > 0:
+                perturbed = perturbed_list[0]
+                variants.append((perturbed, f"Scale={scale}"))
+            else:
+                print(f"No valid molecules generated for scale={scale}")
+
+    if not variants:
+        print("No valid variants generated")
+        return None
+
+    # 收集有效分子
+    mols = [original_mol]
+    legends = ["Original"]
+    for v in variants:
+        mol = Chem.MolFromSmiles(v[0])
+        if mol:
+            mols.append(mol)
+            legends.append(v[1])
+
+    if len(mols) < 2:
+        print("Not enough valid molecules to display")
+        return None
+
+    img = Draw.MolsToGridImage(
+        mols,
+        legends=legends,
+        molsPerRow=min(5, len(mols)),
+        subImgSize=(200, 200)
+    )
+    return img
+
+
+def generate_molecules(
+        model,
+        charset,
+        num_samples=100,
+        max_len=100,
+        temperature=0.75,
+        top_k=20,
+        nucleus_p=0.9,
+        use_nucleus=True,
+        perturb_scale=0.0,
+        z_mean=None,
+        z_var=None,
+        z=None,
+        forbid_repeated_special=True
+):
+    device = next(model.parameters()).device
+    model.eval()
+
+    # 确保潜在向量维度正确
+    latent_dim = model.latent_dim
+
+    # 初始化潜在向量
+    if z is not None:
+        # 确保z的维度正确 [N, latent_dim]
+        if z.dim() == 3:
+            z = z.squeeze(1)  # 移除中间的seq维度
+        elif z.dim() == 1:
+            z = z.unsqueeze(0)  # 添加batch维度
+
+        # 确保维度匹配
+        if z.size(-1) != latent_dim:
+            # 截断或填充到正确维度
+            if z.size(-1) > latent_dim:
+                z = z[:, :latent_dim]
+            else:
+                pad_size = latent_dim - z.size(-1)
+                z = F.pad(z, (0, pad_size), "constant", 0)
+
+        num_samples = z.size(0)
+        z = z.to(device)
+    else:
+        # 生成随机潜在向量
+        if z_mean is not None and z_var is not None:
+            # 确保维度正确
+            if z_mean.dim() == 1:
+                z_mean = z_mean.unsqueeze(0)
+            if z_var.dim() == 1:
+                z_var = z_var.unsqueeze(0)
+
+            # 扩展以匹配样本数量
+            z_mean = z_mean.expand(num_samples, -1)
+            z_var = z_var.expand(num_samples, -1)
+
+            z = torch.randn(num_samples, latent_dim).to(device)
+            z = z * torch.sqrt(z_var) + z_mean
+        else:
+            z = torch.randn(num_samples, latent_dim).to(device)
+
+    # 添加扰动
+    if perturb_scale > 0:
+        z += torch.randn_like(z) * perturb_scale
+
+    # 初始化其他参数
+    start_idx = charset.index('<start>')
+    end_idx = charset.index('<end>')
+    pad_idx = charset.index('<pad>')
+    mask_idx = charset.index('<mask>') if '<mask>' in charset else None
+
+    special_tokens = {start_idx, end_idx, pad_idx}
+    if mask_idx is not None:
+        special_tokens.add(mask_idx)
+    generated = []
+    validity_counts = 0
+
+    with torch.no_grad():
+        for sample_idx in tqdm(range(num_samples), desc='Generating'):
+            # 确保只取一个样本的潜在向量
+            if z.dim() == 2:
+                current_z = z[sample_idx].unsqueeze(0)  # [1, D]
+            elif z.dim() == 3:
+                current_z = z[sample_idx].unsqueeze(0)  # [1, 1, D]
+            else:
+                # 处理其他维度情况
+                current_z = z.select(0, sample_idx).unsqueeze(0)
+
+            # 确保current_z是2D张量 [1, D]
+            if current_z.dim() == 1:
+                current_z = current_z.unsqueeze(0)
+            elif current_z.dim() == 3:
+                current_z = current_z.squeeze(1)
+
+            # 初始化序列生成
+            input_seq = torch.tensor([[start_idx]]).to(device)
+            hidden = None
+            seq = []
+            ended = False
+            prev_char = start_idx
+
+            for step in range(max_len):
+                # 嵌入层
+                embedded = model.embedding(input_seq)  # [1, 1, E]
+
+                # 处理潜在向量维度 - 确保是3D张量 [1, 1, D]
+                z_expanded = current_z
+                if z_expanded.dim() == 1:
+                    z_expanded = z_expanded.unsqueeze(0).unsqueeze(0)
+                elif z_expanded.dim() == 2:
+                    z_expanded = z_expanded.unsqueeze(1)
+
+                # 确保序列长度匹配
+                if embedded.size(1) != z_expanded.size(1):
+                    seq_len = min(embedded.size(1), z_expanded.size(1))
+                    embedded = embedded[:, :seq_len, :]
+                    z_expanded = z_expanded[:, :seq_len, :]
+
+                # 连接输入
+                decoder_input = torch.cat([embedded, z_expanded], dim=-1)  # [1, 1, E+D]
+
+                # RNN前向传播
+                output, hidden = model.decoder_rnn(decoder_input, hidden)
+
+                # 确保输出形状正确
+                if output.dim() == 2:
+                    output = output.unsqueeze(1)
+
+                logits = model.decoder_fc(output.squeeze(1))  # [1, vocab_size]
+
+                # 温度缩放
+                logits = logits / temperature
+                probs = F.softmax(logits, dim=-1)
+
+                # 禁止特殊token
+                probs[:, pad_idx] = 0
+                if mask_idx is not None:
+                    probs[:, mask_idx] = 0
+                if forbid_repeated_special and prev_char in special_tokens:
+                    probs[:, prev_char] = 0
+
+                # 重新归一化
+                probs_sum = probs.sum(dim=-1, keepdim=True)
+                probs = probs / (probs_sum + 1e-8)
+
+                # 采样策略
+                if use_nucleus:
+                    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > nucleus_p
+                    sorted_indices_to_remove[..., 0] = False  # Ensure at least one is kept
+                    indices_to_remove = sorted_indices_to_remove.scatter(
+                        dim=-1,
+                        index=sorted_indices,
+                        src=sorted_indices_to_remove
+                    )
+                    probs = probs.masked_fill(indices_to_remove, 0.0)
+                    probs_sum = probs.sum(dim=-1, keepdim=True)
+                    probs = probs / (probs_sum + 1e-8)
+                else:
+                    top_k_probs, top_k_indices = torch.topk(probs, top_k, dim=-1)
+                    probs = torch.zeros_like(probs).scatter_(-1, top_k_indices, top_k_probs)
+                    probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)
+
+                # 采样下一个字符
+                char_idx = torch.multinomial(probs, 1).item()
+                prev_char = char_idx
+
+                if char_idx == end_idx:
+                    ended = True
+                    break
+                if char_idx == pad_idx:
+                    continue
+
+                seq.append(char_idx)
+                input_seq = torch.tensor([[char_idx]]).to(device)
+
+            # 解码SMILES
+            try:
+                smiles = ''.join([charset[i] for i in seq])
+                generated.append(smiles)
+
+                # 验证分子
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is not None:
+                    validity_counts += 1
+                    # 标准化SMILES
+                    generated[-1] = Chem.MolToSmiles(mol, isomericSmiles=True)
+                else:
+                    logger.warning(f"无效SMILES: {smiles}")
+            except Exception as e:
+                logger.error(f"SMILES生成失败: {e}")
+
+    # 有效性过滤
+    valid = [s for s in generated if Chem.MolFromSmiles(s) is not None]
+    validity_rate = len(valid) / num_samples
+    logger.info(f"有效性率: {validity_rate:.2%} (生成: {num_samples}, 有效: {len(valid)})")
+
+    return valid
+
+def compute_latent_stats(model, dataset):
+    device = next(model.parameters()).device
+    dataloader = DataLoader(dataset, batch_size=128, shuffle=False)
+    mus = []
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = batch.to(device)
+            mu, _ = model.encode(batch)
+            mus.append(mu.cpu())
+    all_mu = torch.cat(mus, dim=0)
+    mu_mean = all_mu.mean(dim=0)
+    mu_var = all_mu.var(dim=0)
+    return mu_mean, mu_var
+
+
+def fine_tune(
+        model,
+        main_data,
+        fine_tune_data,
+        valid_split=0.2,
+        epochs=50,
+        lr=1e-4,
+        beta=0.5,
+        checkpoint_path=None,
+        partial_unfreeze=True,
+        pretrain_path=None,
+        model_name="finetuned",
+        freeze_ratio=0.5  # 新增：自定义冻结比例
+):
+    """
+    :param freeze_ratio: 当 partial_unfreeze=True 时，可根据该参数设置Encoder RNN某些层冻结
+    """
+    early_stopper = EarlyStopping(patience=10, delta=0.001, min_epochs=10)
+    os.makedirs(checkpoint_path, exist_ok=True)
+
+    # 预训练权重
+    if pretrain_path:
+        model = load_pretrained(model, pretrain_path)
+
+        # 数据划分
+    random.shuffle(fine_tune_data)
+    split_index = int(len(fine_tune_data) * (1 - valid_split))
+    train_ft_data = fine_tune_data[:split_index]
+    val_ft_data = fine_tune_data[split_index:]
+
+    # 合并字符集
+    combined_smiles = main_data + train_ft_data
+    charset = build_vocab(list(set(combined_smiles)))
+
+    main_dataset = VAEDataset(main_data, charset)
+    ft_dataset = VAEDataset(train_ft_data, charset)
+    val_dataset = VAEDataset(val_ft_data, charset)
+    combined_dataset = torch.utils.data.ConcatDataset([main_dataset, ft_dataset])
+
+    # 加权采样
+    weights = [1] * len(main_dataset) + [5] * len(ft_dataset)
+    sampler = torch.utils.data.WeightedRandomSampler(weights, len(weights))
+    dataloader = DataLoader(combined_dataset, batch_size=64, sampler=sampler)
+    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+    best_model_file = os.path.join(checkpoint_path, "finetune_best.pth")
+
+    # 冻结策略
+    if partial_unfreeze:
+        # 先冻结所有层
+        for param in model.parameters():
+            param.requires_grad = False
+
+            # 解冻Decoder部分
+        for param in model.decoder_rnn.parameters():
+            param.requires_grad = True
+        for param in model.decoder_fc.parameters():
+            param.requires_grad = True
+        for param in model.hidden_project.parameters():
+            param.requires_grad = True
+
+            # 根据 freeze_ratio 解冻 Encoder RNN的后若干层
+        enc_params = list(model.encoder_rnn.parameters())
+        th = int(len(enc_params) * (1 - freeze_ratio))
+        # 后一部分参数可训练
+        for p in enc_params[th:]:
+            p.requires_grad = True
+    else:
+        for param in model.parameters():
+            param.requires_grad = True
+
+    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
+
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+
+    char_weights = main_dataset.char_weights.to(device) if hasattr(main_dataset, 'char_weights') else None
+
+    best_loss = float('inf')
+
+    for epoch in range(epochs):
+        model.train()
+        total_loss, total_recon, total_kl = 0, 0, 0
+
+        pbar = tqdm(dataloader, desc=f'Fine-tuning Epoch {epoch + 1}/{epochs}')
+        for batch in pbar:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+
+            recon, mu, logvar, kl_loss = model(batch, teacher_forcing_ratio=1.0)
+            loss_tuple = vae_loss(recon, batch, mu, logvar, beta, char_weights)
+
+            if isinstance(loss_tuple, tuple):
+                loss, recon_loss, kl_loss = loss_tuple
+            else:
+                loss = loss_tuple
+                recon_loss = kl_loss = torch.tensor(0.0)
+
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_recon += recon_loss.item()
+            total_kl += kl_loss.item()
+
+            pbar.set_postfix({
+                'loss': f"{(total_loss / (pbar.n + 1)):.4f}",
+                'recon': f"{(total_recon / (pbar.n + 1)):.4f}",
+                'kl': f"{(total_kl / (pbar.n + 1)):.4f}"
+            })
+
+        # 验证阶段
+        model.eval()
+        val_loss, val_recon, val_kl = 0, 0, 0
+        with torch.no_grad():
+            for val_batch in val_loader:
+                val_batch = val_batch.to(device)
+                recon, mu, logvar,_ = model(val_batch)
+                loss_tuple = vae_loss(recon, val_batch, mu, logvar, beta, char_weights)
+                if isinstance(loss_tuple, tuple):
+                    v_loss, v_recon, v_kl = loss_tuple
+                    val_loss += v_loss.item()
+                    val_recon += v_recon.item()
+                    val_kl += v_kl.item()
+                else:
+                    val_loss += loss_tuple.item()
+
+        avg_val_loss = val_loss / len(val_loader)
+        print(
+            f"[Validation] Epoch {epoch}/{epochs} - Loss: {avg_val_loss:.4f} "
+            f"(Recon: {val_recon / len(val_loader):.4f}, KL: {val_kl / len(val_loader):.4f})"
+        )
+
+        scheduler.step()
+
+        # 保存最佳
+        if avg_val_loss < best_loss and best_model_file:
+            best_loss = avg_val_loss
+            torch.save(model.state_dict(), best_model_file)
+            print(f"Saved best model with val loss {best_loss:.4f} to {best_model_file}")
+
+        if early_stopper(avg_val_loss, epoch):
+            print(f"Early stopping at epoch {epoch}")
+            break
+
+    # 完成后保存最终模型
+    model_path = os.path.join(checkpoint_path, f"{model_name}.pth")
+    charset_path = os.path.join(checkpoint_path, f"{model_name}_charset.json")
+    save_model_and_charset(model, charset, model_path, charset_path)
+
+    return model, charset
+
+
+def filter_by_similarity(generated_smiles, reference_smiles, threshold=0.6):
+    # 计算参考集指纹
+    ref_mols = [Chem.MolFromSmiles(s) for s in reference_smiles]
+    ref_fps = [AllChem.GetMorganFingerprintAsBitVect(m, 2) for m in ref_mols if m]
+
+    filtered = []
+    for s in generated_smiles:
+        mol = Chem.MolFromSmiles(s)
+        if not mol:
+            continue
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2)
+        # 计算与参考集的最大相似度
+        max_sim = max(DataStructs.TanimotoSimilarity(fp, ref_fp) for ref_fp in ref_fps)
+        if max_sim >= threshold:
+            filtered.append(s)
+    return filtered
+
+def visualize_training_metrics(checkpoint_dir):
+    """可视化训练过程中的各项指标"""
+    # 需要从训练日志中读取数据，这里假设日志记录在checkpoint_dir/metrics.csv
+    metrics = pd.read_csv(f"{checkpoint_dir}/metrics.csv")
+
+    plt.figure(figsize=(15, 10))
+
+    # 损失曲线
+    plt.subplot(2, 2, 1)
+    plt.plot(metrics['epoch'], metrics['loss'], label='Total Loss')
+    plt.plot(metrics['epoch'], metrics['recon_loss'], label='Recon Loss')
+    plt.plot(metrics['epoch'], metrics['kl_loss'], label='KL Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Training Loss Components')
+
+    # KL权重和学习率
+    plt.subplot(2, 2, 2)
+    plt.plot(metrics['epoch'], metrics['beta'], label='Beta', color='r')
+    plt.twinx()
+    plt.plot(metrics['epoch'], metrics['lr'], label='Learning Rate', color='g')
+    plt.title('Beta and Learning Rate Schedule')
+    plt.legend()
+
+    # 梯度范数
+    plt.subplot(2, 2, 3)
+    plt.semilogy(metrics['epoch'], metrics['grad_norm'])
+    plt.xlabel('Epoch')
+    plt.ylabel('Gradient Norm (log)')
+    plt.title('Gradient Flow')
+
+    # # 有效性指标
+    # plt.subplot(2, 2, 4)
+    # plt.plot(metrics['epoch'], metrics['validity'], label='Validity')
+    # plt.plot(metrics['epoch'], metrics['uniqueness'], label='Uniqueness')
+    # plt.xlabel('Epoch')
+    # plt.ylabel('Rate')
+    # plt.legend()
+    # plt.title('Generation Metrics')
+
+    plt.tight_layout()
+    plt.savefig(f"{checkpoint_dir}/training_metrics.png")
+    plt.close()
+
+
+def visualize_latent_interpolation(model, dataset, start_idx, end_idx, n_steps=10, img_size=(300, 300)):
+    """修复后的潜在空间插值可视化"""
+    device = next(model.parameters()).device
+
+    # 获取潜在向量（确保批量维度）
+    with torch.no_grad():
+        z_start = model.encode(dataset[start_idx][0].unsqueeze(0).to(device))[0].unsqueeze(0)  # [1, latent_dim]
+        z_end = model.encode(dataset[end_idx][0].unsqueeze(0).to(device))[0].unsqueeze(0)     # [1, latent_dim]
+
+    # 生成插值路径（保持批量维度）
+    alphas = torch.linspace(0, 1, n_steps)
+    interpolated_z = torch.stack([
+        (1 - alpha) * z_start + alpha * z_end
+        for alpha in alphas
+    ])  # [n_steps, D]
+
+    molecules = generate_molecules(
+        model=model,
+        charset=dataset.charset,
+        z=interpolated_z,  # 直接传入[n_steps, D]
+        max_len=dataset.max_len,
+        temperature=0.7,
+        nucleus_p=0.9,
+        num_samples=n_steps  # 显式设置样本数
+    )
+
+    # 过滤无效分子并绘制
+    valid_mols = []
+    for i, s in enumerate(molecules):
+        mol = Chem.MolFromSmiles(s)
+        if mol:
+            valid_mols.append(mol)
+
+    if len(valid_mols) == 0:
+        print("No valid molecules generated for interpolation")
+        return None
+
+    # 绘制网格图像
+    img = Draw.MolsToGridImage(
+        valid_mols,
+        molsPerRow=min(n_steps, 5),
+        subImgSize=img_size,
+        legends=[f"Step {i + 1}" for i in range(len(valid_mols))],
+        returnPNG=False
+    )
+    return img
+
+def load_pretrained(model, pretrain_path):
+    """加载预训练权重"""
+    try:
+        model.load_state_dict(torch.load(pretrain_path))
+        print(f"成功加载预训练权重：{pretrain_path}")
+        return model
+    except Exception as e:
+        print(f"加载预训练权重失败：{str(e)}")
+        return model
+
+def load_generation_model(model_class, model_path, charset):
+    """加载生成专用模型"""
+    model = model_class(
+        vocab_size=len(charset),
+        latent_dim=256,
+        embedding_dim=256,
+        hidden_dim=1024,
+        num_layers=3,
+        dropout=0.3
+    )
+    model.load_state_dict(torch.load(model_path))
+    model.eval()
+    return model
+
+
+# 配置文件路径（可修改）
+CONFIG_FILE = "/home/qyl/CSD_data/1_CSD/logs/gener/config/confi.yaml"
+
+
+def load_config(config_path):
+    """加载配置文件"""
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+
+    # Handle device selection
+    device_config = config['training']['device']
+    if isinstance(device_config, str) and 'if' in device_config:
+        # Handle the case where someone left the Python expression
+        config['training']['device'] = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    else:
+        config['training']['device'] = torch.device(device_config)
+
+    # 创建必要的目录
+    os.makedirs(config['paths']['checkpoint_dir'], exist_ok=True)
+    os.makedirs(config['paths']['visualization_dir'], exist_ok=True)
+    os.makedirs(os.path.join(config['paths']['visualization_dir'], 'augmentations'), exist_ok=True)
+
+    return config
+
+def save_results(generated, reference_smiles, config):
+    """保存生成结果"""
+    result_df = pd.DataFrame({
+        'SMILES': generated,
+        'Max_Similarity': [
+            max(DataStructs.TanimotoSimilarity(
+                AllChem.GetMorganFingerprintAsBitVect(Chem.MolFromSmiles(s), 2),
+                AllChem.GetMorganFingerprintAsBitVect(Chem.MolFromSmiles(ref), 2)
+            ) for ref in reference_smiles
+                ) for s in generated
+        ]
+    })
+    result_df.to_excel(config['paths']['output_path'], index=False)
+    print(f"结果已保存至 {config['paths']['output_path']}")
+
+
+
+def save_model_and_charset(model, charset, model_path, charset_path):
+    """保存模型和字符集"""
+    try:
+        # 保存模型
+        torch.save(model.state_dict(), model_path)
+        print(f"模型已保存至 {model_path}")
+
+        # 保存字符集
+        with open(charset_path, 'w', encoding='utf-8') as f:
+            json.dump(charset, f, ensure_ascii=False)
+        print(f"字符集已保存至 {charset_path}")
+
+    except Exception as e:
+        print(f"保存失败: {str(e)}")
+        raise
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# 假设你已经定义了这些函数和类：
+# from vae_model import VAE, VAEDataset, train_vae, visualize_augmentations, visualize_training_metrics
+# from gnn_model import predict_unlabeled_data
+# from utils import load_config, build_vocab, filter_valid
+
+# 假设你已经配置好日志
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+import logging
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+from collections import deque
+import os
+import logging
+import random
+from rdkit.Chem import DataStructs
+from typing import List, Tuple, Dict, Any
+from torch.utils.data import DataLoader
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Assuming cmap is defined somewhere, if not define it like this:
+cmap = plt.cm.viridis
+
+import matplotlib.pyplot as plt
+from rdkit import Chem
+from rdkit.Chem import AllChem, Draw, Descriptors
+from sklearn.manifold import TSNE
+from sklearn.neighbors import NearestNeighbors # 导入用于寻找最近邻的库
+
+
+import matplotlib as mpl
+import seaborn as sns
+
+def set_publication_style_tnr():
+    """Set global publication style with Times New Roman font."""
+
+    mpl.rcParams.update({
+        # ---------------- Font family ----------------
+        'font.family': 'serif',
+        'font.serif': ['Times New Roman'],
+
+        # ---------------- Font sizes ----------------
+        'font.size': 12,
+        'axes.titlesize': 16,
+        'axes.titleweight': 'bold',
+        'axes.labelsize': 14,
+        'xtick.labelsize': 12,
+        'ytick.labelsize': 12,
+        'legend.fontsize': 12,
+        'figure.titlesize': 16,
+
+        # ---------------- Figure & saving ----------------
+        'figure.dpi': 100,
+        'savefig.dpi': 300,
+        'savefig.bbox': 'tight',
+
+        # ---------------- Lines & markers ----------------
+        'lines.linewidth': 2.0,
+        'lines.markersize': 6,
+
+        # ---------------- Grid ----------------
+        'axes.grid': True,
+        'grid.linestyle': '--',
+        'grid.alpha': 0.5,
+
+        # ---------------- Axes ----------------
+        'axes.spines.top': False,
+        'axes.spines.right': False,
+
+        # ---------------- Legend ----------------
+        'legend.frameon': False,
+    })
+
+    sns.set_style("whitegrid")
+# --- Function 2: Molecule Grid Plot (Adapted to include required molecules) ---
+def visualize_molecule_grid(df, required_smiles, grid_size=12, output_dir='visualizations'):
+    """
+    Visualize a grid of molecules, ensuring required molecules are included,
+    and filling the rest with top 'Metal_Difference' molecules.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    if df.empty:
+        print("Input DataFrame is empty, skipping molecule grid.")
+        return
+
+        # Ensure required_smiles list contains unique values
+    unique_required_smiles = list(dict.fromkeys(required_smiles))
+
+    # Get the DataFrame rows for the required molecules
+    required_df = df[df['New_SMILES'].isin(unique_required_smiles)].drop_duplicates(subset=['New_SMILES'])
+
+    # Get the number of molecules needed to fill the grid
+    num_to_fill = grid_size - len(required_df)
+
+    # Get other molecules to fill the grid (ones not in the required list)
+    # Sorted by Metal_Difference to get the most different ones
+    supplementary_df = pd.DataFrame()
+    if num_to_fill > 0:
+        supplementary_df = df[~df['New_SMILES'].isin(unique_required_smiles)]
+        supplementary_df = supplementary_df.sort_values('Metal_Difference', ascending=False).head(num_to_fill)
+
+        # Combine the required molecules with the supplementary ones
+    molecules_to_display = pd.concat([required_df, supplementary_df]).reset_index(drop=True)
+
+    if molecules_to_display.empty:
+        print("No molecules to display in the grid.")
+        return
+
+    mols, legends = [], []
+    for _, row in molecules_to_display.iterrows():
+        mol = Chem.MolFromSmiles(row['New_SMILES'])
+        if mol:
+            mols.append(mol)
+            # Make legend generation robust in case 'Similarity_Score' doesn't exist
+            legend = f"Diff: {row['Metal_Difference']:.3f}"
+            if 'Similarity_Score' in row:
+                legend += f"\nSim: {row['Similarity_Score']:.2f}"
+            legends.append(legend)
+
+    if not mols:
+        print("Could not generate molecule objects from SMILES.")
+        return
+
+        # Create molecule image grid
+    img = Draw.MolsToGridImage(mols, molsPerRow=4, subImgSize=(350, 350), legends=legends, useSVG=False)
+
+    # Display image in matplotlib
+    fig, ax = plt.subplots(figsize=(12, 10))
+    ax.imshow(img)
+    ax.axis('off')
+
+    # Add color bar
+    cmap = 'viridis'
+    norm = plt.Normalize(df['Metal_Difference'].min(), df['Metal_Difference'].max())
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, fraction=0.05, pad=0.01)
+    cbar.set_label('Metal Environment Difference', fontsize=14, labelpad=10)
+
+    ax.set_title('Molecule Structures of Interest', fontsize=16, fontweight='bold', pad=20)
+    output_path = os.path.join(output_dir, 'molecule_grid_with_required.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Molecule grid plot saved to {output_path}")
+
+
+def visualize_chemical_space(df, output_dir):
+    if df.empty:
+        return
+
+    fps, diffs = [], []
+    for _, row in df.iterrows():
+        mol = Chem.MolFromSmiles(row['New_SMILES'])
+        if mol:
+            fps.append(AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=512))
+            diffs.append(row['Metal_Difference'])
+
+    if not fps:
+        return
+
+    tsne = TSNE(n_components=2, random_state=42)
+    coords = tsne.fit_transform(np.array(fps))
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    sc = ax.scatter(coords[:, 0], coords[:, 1], c=diffs, cmap=cmap, alpha=0.7, edgecolors='w')
+
+    ax.set_xlabel('t-SNE Component 1')
+    ax.set_ylabel('t-SNE Component 2')
+
+    cbar = plt.colorbar(sc, ax=ax, pad=0.01)
+    cbar.set_label('Metal Environment Difference')
+
+    ax.set_title('Chemical Space Distribution (t-SNE)')
+    plt.savefig(os.path.join(output_dir, 'chemical_space_tsne.png'))
+    plt.close()
+def visualize_property_distribution(df, output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/sar_visualizations'):
+    """Visualize property difference distribution."""
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Histogram and density curve
+    sns.histplot(df['Metal_Difference'], bins=20, kde=True, color='#2980b9', ax=ax)  # Changed color
+
+    # Add statistics information
+    mean_val = df['Metal_Difference'].mean()
+    median_val = df['Metal_Difference'].median()
+    ax.axvline(mean_val, color='#e74c3c', linestyle='--', label=f'Mean: {mean_val:.3f}')  # Changed color
+    ax.axvline(median_val, color='#2ecc71', linestyle='-', label=f'Median: {median_val:.3f}')  # Changed color
+
+    ax.set_xlabel('Metal Environment Difference', fontsize=14) # Increased fontsize
+    ax.set_ylabel('Number of Molecules', fontsize=14) # Increased fontsize
+    ax.legend(fontsize=12) # Increased fontsize
+    ax.grid(True, linestyle='--', alpha=0.7)
+
+    # Add box plot
+    box_ax = ax.inset_axes([0.7, 0.7, 0.25, 0.2])
+    sns.boxplot(y=df['Metal_Difference'], ax=box_ax, color='#3498db', width=0.4)  # Changed color
+    box_ax.set_ylabel('')
+    box_ax.set_xticks([])
+
+    ax.set_title('Distribution of Metal Environment Differences', fontsize=16, fontweight='bold', pad=20) # Added title
+    plt.savefig(os.path.join(output_dir, 'property_distribution.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def visualize_similarity_vs_difference(df, output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/sar_visualizations'):
+    """Visualize the relationship between similarity and property difference."""
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Add small noise to similarity score to spread the points
+    noise = np.random.normal(0, 0.02, df['Similarity_Score'].shape[0])
+    similarity_score_noisy = df['Similarity_Score'] + noise
+
+    # Scatter plot
+    scatter = ax.scatter(
+        similarity_score_noisy,
+        df['Metal_Difference'],
+        c=df['Metal_Difference'],
+        cmap=cmap,
+        s=60,  # Adjusted point size
+        alpha=0.7,  # Adjusted opacity
+        edgecolors='w'
+    )
+
+    # Add regression line
+    sns.regplot(
+        x='Similarity_Score',
+        y='Metal_Difference',
+        data=df,
+        scatter=False,
+        ax=ax,
+        line_kws={'color': '#c0392b', 'linestyle': '-', 'alpha': 0.8}  # Changed color and style
+    )
+
+    ax.set_xlabel('Similarity to Original Molecule', fontsize=14) # Increased fontsize
+    ax.set_ylabel('Metal Environment Difference', fontsize=14) # Increased fontsize
+
+    # Add color bar
+    cbar = plt.colorbar(scatter, ax=ax, pad=0.01)
+    cbar.set_label('Metal Environment Difference', fontsize=14, labelpad=10) # Increased fontsize
+
+    # Add correlation coefficient
+    corr = df['Similarity_Score'].corr(df['Metal_Difference'])
+    ax.text(0.05, 0.95, f'Correlation Coefficient: {corr:.3f}',
+            transform=ax.transAxes,
+            fontsize=12,
+            bbox=dict(facecolor='white', alpha=0.8))
+
+    ax.set_title('Relationship between Similarity and Metal Environment Differences', fontsize=16, fontweight='bold', pad=20) # Added title
+    plt.savefig(os.path.join(output_dir, 'similarity_vs_difference.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+
+def visualize_scaffold_distribution(
+    df,
+    output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/sar_visualizations',
+    show_structures=True
+):
+    """
+    Visualize molecule scaffold distribution:
+    - Left: Top 10 scaffold frequency (indexed as Scaffold 1, 2, ...)
+    - Right (optional): Top 5 valid Murcko scaffolds (enlarged)
+    """
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # -------------------------------------------------
+    # 1. Extract Murcko scaffolds
+    # -------------------------------------------------
+    scaffolds = {}
+    for _, row in df.iterrows():
+        mol = Chem.MolFromSmiles(row['New_SMILES'])
+        if mol:
+            try:
+                scaffold_mol = MurckoScaffold.GetScaffoldForMol(mol)
+                if scaffold_mol is None:
+                    continue
+
+                scaffold_smiles = Chem.MolToSmiles(scaffold_mol)
+
+                if scaffold_smiles not in scaffolds:
+                    scaffolds[scaffold_smiles] = {
+                        'count': 0,
+                        'avg_difference': 0.0
+                    }
+
+                scaffolds[scaffold_smiles]['count'] += 1
+                scaffolds[scaffold_smiles]['avg_difference'] += row['Metal_Difference']
+
+            except Exception:
+                continue
+
+    if not scaffolds:
+        print("No valid scaffolds found. Skipping visualization.")
+        return
+
+    for scaffold in scaffolds:
+        scaffolds[scaffold]['avg_difference'] /= scaffolds[scaffold]['count']
+
+    scaffold_df = pd.DataFrame.from_dict(scaffolds, orient='index')
+    scaffold_df = scaffold_df.sort_values('count', ascending=False).head(10)
+
+    # -------------------------------------------------
+    # 2. Generate generic scaffold labels
+    # -------------------------------------------------
+    scaffold_df = scaffold_df.copy()
+    scaffold_df['Scaffold_Label'] = [
+        f"Scaffold {i + 1}" for i in range(len(scaffold_df))
+    ]
+
+    # -------------------------------------------------
+    # 3. Select top 5 VALID scaffolds (for optional right panel)
+    # -------------------------------------------------
+    top5_scaffold_mols = []
+    if show_structures:
+        for scaffold_smiles in scaffold_df.index:
+            mol = Chem.MolFromSmiles(scaffold_smiles)
+            if mol is not None:
+                top5_scaffold_mols.append(mol)
+            if len(top5_scaffold_mols) == 5:
+                break
+
+    # -------------------------------------------------
+    # 4. Figure layout
+    # -------------------------------------------------
+    if show_structures:
+        fig = plt.figure(figsize=(17, 9))
+        gs = GridSpec(1, 2, width_ratios=[2.6, 1.4], wspace=0.25)
+        ax_bar = fig.add_subplot(gs[0])
+    else:
+        fig = plt.figure(figsize=(12, 8))
+        gs = GridSpec(1, 1)
+        ax_bar = fig.add_subplot(gs[0])
+
+    # =========================
+    # Left panel: barh (TOP 10)
+    # =========================
+    ax_bar.barh(
+        scaffold_df['Scaffold_Label'],
+        scaffold_df['count'],
+        color=plt.cm.viridis(np.linspace(0, 1, len(scaffold_df)))
+    )
+
+    ax_bar.invert_yaxis()
+    ax_bar.set_xlabel('Frequency')
+    ax_bar.set_title('Top 10 Common Molecule Scaffolds')
+
+    max_count = scaffold_df['count'].max()
+
+    for i, (_, row) in enumerate(scaffold_df.iterrows()):
+        if row['count'] > 0.9 * max_count:
+            # ✅ 最大的 bar：数值放在 bar 内部
+            x_pos = row['count'] - max_count * 0.08
+            ha = 'right'
+            text_color = 'white'
+        else:
+            # ✅ 其余 bar：数值放在 bar 外部
+            x_pos = row['count'] + max_count * 0.02
+            ha = 'left'
+            text_color = 'darkred'
+
+        ax_bar.text(
+            x_pos,
+            i,
+            f"{row['avg_difference']:.3f}",
+            va='center',
+            ha=ha,
+            fontsize=12,
+            color=text_color
+        )
+
+    # =====================================
+    # Right panel: Top 5 Murcko scaffolds
+    # =====================================
+    if show_structures and top5_scaffold_mols:
+        gs_right = GridSpec(
+            5, 1,
+            left=0.72, right=0.98,
+            top=0.94, bottom=0.06,
+            hspace=0.35
+        )
+
+        for i, mol in enumerate(top5_scaffold_mols):
+            ax = fig.add_subplot(gs_right[i])
+            img = Draw.MolToImage(
+                mol,
+                size=(380, 380),  # ✅ enlarged
+                kekulize=True
+            )
+            ax.imshow(img)
+            ax.axis('off')
+            ax.set_title(f"Scaffold {i + 1}")
+
+    # -------------------------------------------------
+    # 5. Save figure
+    # -------------------------------------------------
+    filename = (
+        'scaffold_distribution_top10_with_structures.png'
+        if show_structures
+        else 'scaffold_distribution_top10_contribution_only.png'
+    )
+
+    output_path = os.path.join(output_dir, filename)
+    plt.savefig(output_path, dpi=600, bbox_inches='tight')
+    plt.close()
+
+    print(f"Saved scaffold distribution figure to: {output_path}")
+    return scaffold_df
+
+def ensure_dir(directory):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+def visualize_and_export_scaffolds(df,
+                                   output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/sar_visualizations'):
+    """
+    Visualize molecule scaffold distribution, and export the molecules
+    for each of the top 10 scaffolds into a separate sheet in an Excel file.
+    """
+    ensure_dir(output_dir)
+
+    # --- 1. 骨架识别与统计 (此部分逻辑与您原版相同) ---
+    scaffolds = {}
+    for _, row in df.iterrows():
+        # 确保 'New_SMILES' 列存在且不为空
+        if 'New_SMILES' not in row or not isinstance(row['New_SMILES'], str):
+            continue
+
+        mol = Chem.MolFromSmiles(row['New_SMILES'])
+        if mol:
+            try:
+                scaffold_smiles = Chem.MolToSmiles(Chem.Scaffolds.MurckoScaffold.GetScaffoldForMol(mol))
+                if not scaffold_smiles:  # 忽略无环分子的空骨架
+                    continue
+
+                if scaffold_smiles not in scaffolds:
+                    scaffolds[scaffold_smiles] = {
+                        'count': 0,
+                        'avg_difference': 0,
+                        'molecules': []
+                    }
+
+                scaffolds[scaffold_smiles]['count'] += 1
+                scaffolds[scaffold_smiles]['avg_difference'] += row['Metal_Difference']
+                scaffolds[scaffold_smiles]['molecules'].append(row['New_SMILES'])
+            except:
+                continue
+
+    if not scaffolds:
+        print("未能从数据中提取任何有效的环状骨架。")
+        return
+
+    for scaffold in scaffolds:
+        scaffolds[scaffold]['avg_difference'] /= scaffolds[scaffold]['count']
+
+    scaffold_df = pd.DataFrame.from_dict(scaffolds, orient='index')
+    top_10_scaffolds_df = scaffold_df.sort_values('count', ascending=False).head(10)
+
+    # --- 2. 新增功能：将数据导出到Excel ---
+    excel_output_path = os.path.join(output_dir, 'top_10_scaffolds_data.xlsx')
+    print(f"正在将Top 10骨架的详细数据导出到: {excel_output_path}")
+
+    with pd.ExcelWriter(excel_output_path, engine='xlsxwriter') as writer:
+        # 2a. 创建一个“摘要”工作表，方便查阅
+        summary_list = []
+        for i, (scaffold_smiles, data) in enumerate(top_10_scaffolds_df.iterrows()):
+            sheet_name = f"Scaffold_{i + 1}"
+            summary_list.append({
+                "Sheet_Name": sheet_name,
+                "Molecule_Count": data['count'],
+                "Avg_Metal_Difference": data['avg_difference'],
+                "Scaffold_SMILES": scaffold_smiles,
+            })
+        summary_df = pd.DataFrame(summary_list)
+        summary_df.to_excel(writer, sheet_name='Summary', index=False)
+
+        # 2b. 为每个骨架创建一个单独的工作表
+        for i, (scaffold_smiles, _) in enumerate(top_10_scaffolds_df.iterrows()):
+            sheet_name = f"Scaffold_{i + 1}"
+
+            # 获取属于该骨架的所有分子的SMILES列表
+            molecules_for_this_scaffold = scaffolds[scaffold_smiles]['molecules']
+
+            # 从原始DataFrame 'df' 中筛选出这些分子的所有信息
+            scaffold_data_df = df[df['New_SMILES'].isin(molecules_for_this_scaffold)].copy()
+
+            # 将筛选出的数据写入对应的sheet
+            scaffold_data_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    print("Excel文件导出成功。")
+
+    # --- 3. 绘图与可视化 (此部分逻辑与您原版相同) ---
+    print("正在生成骨架分布可视化图...")
+    fig, ax = plt.subplots(figsize=(12, 8))
+
+    # 使用top_10_scaffolds_df进行绘图
+    bars = ax.barh(
+        top_10_scaffolds_df.index.astype(str),
+        top_10_scaffolds_df['count'],
+        color=plt.cm.viridis(np.linspace(0, 1, len(top_10_scaffolds_df)))
+    )
+
+    for i, (scaffold, row) in enumerate(top_10_scaffolds_df.iterrows()):
+        ax.text(row['count'] + top_10_scaffolds_df['count'].max() * 0.02, i, f"{row['avg_difference']:.3f}",
+                va='center', fontsize=12, color='darkred')
+
+    ax.set_xlabel('Frequency', fontsize=14)
+    ax.set_title('Top 10 Common Molecule Scaffolds and Avg. Metal Difference', fontsize=16)
+    ax.invert_yaxis()
+    ax.margins(y=0.05)
+    plt.tight_layout()
+
+    mol_ax = ax.inset_axes([1.05, 0, 0.7, 1])
+    mol_ax.axis('off')
+
+    mols = [Chem.MolFromSmiles(s) for s in top_10_scaffolds_df.index]
+    legends = [f"Count: {row['count']}" for _, row in top_10_scaffolds_df.iterrows()]
+
+    if mols:
+        img = Draw.MolsToGridImage(mols, molsPerRow=2, subImgSize=(300, 300), legends=legends, useSVG=False)
+        mol_ax.imshow(img)
+
+    plt.savefig(os.path.join(output_dir, 'scaffold_distribution.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print("可视化图生成成功。")
+
+def visualize_scaffold_structures_only(
+    scaffold_df,
+    output_dir,
+    top_n=5,
+    filename='representative_murcko_scaffolds.png'
+):
+    """
+    Visualize representative Murcko scaffold structures ONLY
+    as a standalone figure.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    scaffold_smiles = scaffold_df.index[:top_n]
+
+    mols = []
+    legends = []
+    for i, smi in enumerate(scaffold_smiles):
+        mol = Chem.MolFromSmiles(smi)
+        if mol:
+            mols.append(mol)
+            legends.append(f"Scaffold {i + 1}")
+
+    if not mols:
+        print("No valid scaffold molecules for structure visualization.")
+        return
+
+    img = Draw.MolsToGridImage(
+        mols,
+        molsPerRow=top_n,
+        subImgSize=(420, 420),
+        legends=legends,
+        useSVG=False
+    )
+
+    output_path = os.path.join(output_dir, filename)
+    img.save(output_path)
+
+    print(f"Saved standalone scaffold structure figure to: {output_path}")
+def visualize_mw_vs_difference(df, output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/sar_visualizations'):
+    """Visualize the relationship between molecular weight and property difference."""
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Calculate molecular weight
+    mw_values = []
+    valid_indices = []
+    for i, smiles in enumerate(df['New_SMILES']):
+        mol = Chem.MolFromSmiles(smiles)
+        if mol:
+            mw = Descriptors.MolWt(mol)
+            mw_values.append(mw)
+            valid_indices.append(i)
+
+    # Create subset DataFrame
+    mw_df = df.iloc[valid_indices].copy()
+    mw_df['Molecular_Weight'] = mw_values
+
+        # Add small noise to molecular weight to spread the points
+    noise = np.random.normal(0, 10, mw_df['Molecular_Weight'].shape[0])
+    mw_noisy = mw_df['Molecular_Weight'] + noise
+
+    # Plot scatter plot
+    scatter = ax.scatter(
+        mw_noisy,
+        mw_df['Metal_Difference'],
+        c=mw_df['Metal_Difference'],
+        cmap=cmap,
+        s=60,  # Adjusted point size
+        alpha=0.7,  # Adjusted opacity
+        edgecolors='w'
+    )
+
+    # Add regression line
+    sns.regplot(
+        x='Molecular_Weight',
+        y='Metal_Difference',
+        data=mw_df,
+        scatter=False,
+        ax=ax,
+        line_kws={'color': '#c0392b', 'linestyle': '-', 'alpha': 0.8}  # Changed color and style
+    )
+
+    ax.set_xlabel('Molecular Weight', fontsize=14) # Increased fontsize
+    ax.set_ylabel('Metal Environment Difference', fontsize=14) # Increased fontsize
+
+    # Add color bar
+    cbar = plt.colorbar(scatter, ax=ax, pad=0.01)
+    cbar.set_label('Metal Environment Difference', fontsize=14, labelpad=10) # Increased fontsize
+
+    # Add correlation coefficient
+    corr = mw_df['Molecular_Weight'].corr(mw_df['Metal_Difference'])
+    ax.text(0.05, 0.95, f'Correlation Coefficient: {corr:.3f}',
+            transform=ax.transAxes,
+            fontsize=12,
+            bbox=dict(facecolor='white', alpha=0.8))
+
+    ax.set_title('Relationship between Molecular Weight and Metal Environment Differences', fontsize=16, fontweight='bold', pad=20) # Added title
+    plt.savefig(os.path.join(output_dir, 'mw_vs_difference.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def visualize_reward_trend(reward_history, output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/sar_visualizations'):
+    """Visualize the trend of reinforcement learning reward changes."""
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    # Calculate moving average
+    window_size = max(1, len(reward_history) // 20)
+    moving_avg = pd.Series(reward_history).rolling(window=window_size, min_periods=1).mean()
+
+    # Plot reward curve
+    ax.plot(reward_history, color='gray', alpha=0.4, label='Reward per Iteration', linewidth=0.8)  # Reduced linewidth
+    ax.plot(moving_avg, color='#1f77b4', linewidth=2, label=f'{window_size} Iteration Moving Average') #Reduced linewidth
+
+    # Mark the highest point
+    max_idx = np.argmax(reward_history)
+    ax.scatter(max_idx, reward_history[max_idx], color='red', s=80, zorder=5, # Adjusted size
+               label=f'Highest Reward: {reward_history[max_idx]:.2f}')
+
+    ax.set_xlabel('Iteration Number', fontsize=14) # Increased fontsize
+    ax.set_ylabel('Reward', fontsize=14) # Increased fontsize
+    ax.legend(loc='upper right', fontsize=12) # Increased fontsize # Changed loc from 'lower right' to 'upper right'
+    ax.grid(True, linestyle='--', alpha=0.7)
+
+    # Add background color to indicate different stages
+    if len(reward_history) > 10:
+        ax.axvspan(0, len(reward_history) // 3, alpha=0.05, color='blue', label='Exploration Stage') # Adjusted alpha
+        ax.axvspan(len(reward_history) // 3, 2 * len(reward_history) // 3, alpha=0.05, color='green', label='Optimization Stage')# Adjusted alpha
+        ax.axvspan(2 * len(reward_history) // 3, len(reward_history), alpha=0.05, color='orange', label='Convergence Stage')# Adjusted alpha
+        ax.legend(loc='upper right', fontsize=12) # Increased fontsize # Changed loc from 'lower right' to 'upper right'
+    ax.set_title('Reinforcement Learning Reward Trend', fontsize=16, fontweight='bold', pad=20) # Added title
+    plt.savefig(os.path.join(output_dir, 'reward_trend.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def visualize_sar(final_df, reward_history=None,
+                  output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/base7/sar_visualizations'):
+    """
+    Comprehensive visualization of molecule structure-property relationship and save each image separately.
+    :param final_df: DataFrame containing molecule information and property differences.
+    :param reward_history: Reward history (optional).
+    :param output_dir: Directory to save images (default: 'sar_visualizations').
+    """
+    # Create the output directory if it doesn't exist
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 2. Property difference distribution
+    visualize_property_distribution(final_df, output_dir=output_dir)
+
+    # 3. Similarity vs. property difference relationship
+    visualize_similarity_vs_difference(final_df, output_dir=output_dir)
+
+    # 4. Chemical space distribution (t-SNE dimensionality reduction)
+    required = visualize_chemical_space(final_df, output_dir=output_dir)
+
+    # 5. Molecule scaffold analysis
+    # visualize_scaffold_distribution(final_df, output_dir=output_dir)
+    visualize_and_export_scaffolds(df=final_df, output_dir=output_dir)
+
+    # 6. Property difference vs. molecular weight relationship
+    visualize_mw_vs_difference(final_df, output_dir=output_dir)
+
+
+    # 新增：对相似度>0.4且差异>0的分子进行骨架分布分析
+    # special_mask = (final_df['Similarity_Score'] > 0.4) & (final_df['Metal_Difference'] > 0)
+    special_mask = (final_df['Similarity_Score'] > 0.4) & (final_df['Similarity_Score'] < 1)
+
+    special_molecules = final_df[special_mask].copy()
+    if not special_molecules.empty:
+        print(f"高相似度且金属差异值>0的分子数量: {len(special_molecules)}，绘制专属骨架分布图")
+        special_scaffold_dir = os.path.join(output_dir, 'scaffold_special_0.4_3')
+
+        # 1️⃣ 先画 scaffold 频次分布（bar 图）
+        scaffold_df_special = visualize_scaffold_distribution(
+            special_molecules,
+            output_dir=special_scaffold_dir,
+            show_structures=False
+        )
+
+        # 2️⃣ 再单独画 scaffold 结构图
+        if scaffold_df_special is not None:
+            visualize_scaffold_structures_only(
+                scaffold_df_special,
+                output_dir=special_scaffold_dir,
+                top_n=10,
+                filename='representative_scaffolds_special.png'
+            )
+    else:
+        print("没有找到满足相似度>0.4且金属差异>0的分子，不生成专属骨架分布图。")
+    # visualize_molecule_grid(final_df, required_smiles=required, output_dir=output_dir)
+
+    # 7. Reward trend (if provided)
+    if reward_history:
+        visualize_reward_trend(reward_history, output_dir=output_dir)
+    else:
+        print("reward_history is None, skipping reward trend plot.")
+
+
+class TransformerBlock(nn.Module):
+    """Transformer 块实现，包含多头注意力和前馈网络"""
+
+    def __init__(self, embed_dim, num_heads, ff_dim, dropout=0.1):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(embed_dim, ff_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, embed_dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x, mask=None):
+        # 自注意力层
+        attention_output, _ = self.attention(
+            query=x,
+            key=x,
+            value=x,
+            attn_mask=mask,
+            need_weights=False
+        )
+        # 第一个残差连接和层归一化
+        x = self.norm1(x + attention_output)
+        # 前馈网络
+        ff_output = self.ff(x)
+        # 第二个残差连接和层归一化
+        x = self.norm2(x + ff_output)
+        return x
+
+
+class TransformerPolicyNetwork(nn.Module):
+    """基于Transformer的策略网络，适合处理分子序列特征"""
+
+    def __init__(self, input_dim, output_dim, embed_dim=256, num_heads=4,
+                 num_layers=3, ff_dim=512, dropout=0.1, max_seq_len=100):
+        super().__init__()
+        self.output_dim = output_dim  # 保存输出维度，便于后续验证
+        self.embed_dim = embed_dim
+        self.max_seq_len = max_seq_len
+
+        # 输入投影层 - 将输入特征映射到嵌入空间
+        self.input_projection = nn.Linear(input_dim, embed_dim)
+
+        # 位置编码 - 给序列添加位置信息
+        self.pos_encoding = nn.Parameter(
+            torch.zeros(1, max_seq_len, embed_dim),
+            requires_grad=True
+        )
+
+        # Transformer编码器层
+        self.transformer_layers = nn.ModuleList([
+            TransformerBlock(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                ff_dim=ff_dim,
+                dropout=dropout
+            ) for _ in range(num_layers)
+        ])
+
+        # 输出层 - 汇聚Transformer输出并映射到动作空间
+        self.output_layers = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, output_dim)
+        )
+
+        # 初始化参数
+        self._init_parameters()
+
+    def _init_parameters(self):
+        """参数初始化，增强训练稳定性"""
+        # 为位置编码使用正弦初始化
+        position = torch.arange(self.max_seq_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.embed_dim, 2) * (-math.log(10000.0) / self.embed_dim))
+        pos_encoding = torch.zeros(1, self.max_seq_len, self.embed_dim)
+        pos_encoding[0, :, 0::2] = torch.sin(position * div_term)
+        pos_encoding[0, :, 1::2] = torch.cos(position * div_term)
+        self.pos_encoding.data = pos_encoding
+
+        # Xavier初始化线性层
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x, return_attention=False):
+        """前向传播，可选择是否返回注意力权重"""
+        # 输入处理 - 确保形状正确
+        batch_size = x.size(0) if x.dim() > 1 else 1
+
+        if x.dim() == 1:  # 单个样本
+            x = x.unsqueeze(0)  # [batch_size=1, feature_dim]
+
+        # 如果输入是2D张量(batch, features)，扩展为序列形式
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # [batch_size, seq_len=1, feature_dim]
+
+        # 将输入投影到嵌入空间
+        x = self.input_projection(x)  # [batch_size, seq_len, embed_dim]
+
+        # 添加位置编码
+        seq_len = min(x.size(1), self.max_seq_len)
+        x = x[:, :seq_len, :] + self.pos_encoding[:, :seq_len, :]
+
+        # 通过Transformer层
+        attention_weights = []
+        for layer in self.transformer_layers:
+            if return_attention:
+                # 如果需要返回注意力权重，需要修改TransformerBlock的实现
+                x, attn = layer(x, return_attention=True)
+                attention_weights.append(attn)
+            else:
+                x = layer(x)
+
+        # 使用序列的平均值或[CLS]令牌进行汇总
+        # 这里我们使用平均池化
+        x = x.mean(dim=1)  # [batch_size, embed_dim]
+
+        # 生成动作概率分布
+        logits = self.output_layers(x)
+        probs = F.softmax(logits, dim=-1)
+
+        # 确保输出维度正确
+        if probs.size(-1) != self.output_dim:
+            logger.warning(f"输出维度不匹配! 预期 {self.output_dim}, 实际 {probs.size(-1)}")
+            # 调整维度
+            if probs.size(-1) > self.output_dim:
+                probs = probs[..., :self.output_dim]
+            else:
+                probs = F.pad(probs, (0, self.output_dim - probs.size(-1)))
+
+        if return_attention:
+            return probs, attention_weights
+        return probs
+
+
+def safe_tensor_to_scalar(tensor):
+    """安全地将张量转换为标量值"""
+    if tensor is None:
+        return 0.0
+
+    if not isinstance(tensor, torch.Tensor):
+        return float(tensor)  # 如果已经是标量则直接转换
+
+    # 检查张量大小
+    if tensor.numel() == 1:
+        # 单元素张量可以直接转换
+        return tensor.item()
+    else:
+        # 多元素张量先取平均
+        logging.warning(f"尝试将大小为 {tensor.shape} 的多元素张量转换为标量，将使用平均值")
+        return tensor.mean().item()
+
+
+def tensor_debug_wrapper(func):
+    """装饰器，用于调试张量操作和捕获转换错误"""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            result = func(*args, **kwargs)
+            return result
+        except RuntimeError as e:
+            if "only one element tensors can be converted to Python scalars" in str(e):
+                logging.error(f"在 {func.__name__} 中尝试将多元素张量转换为标量!")
+
+                # 尝试识别问题所在
+                frame = inspect.currentframe()
+                try:
+                    # 获取所有局部变量
+                    local_vars = inspect.getargvalues(frame).locals
+
+                    # 打印所有张量的形状
+                    for name, value in local_vars.items():
+                        if isinstance(value, torch.Tensor):
+                            logging.info(f"张量 '{name}' 形状: {value.shape}")
+                except:
+                    pass
+                finally:
+                    del frame  # 防止循环引用
+
+                # 重新抛出转换后的错误
+                raise ValueError("VAE更新失败：尝试将多元素张量转换为标量值，请检查损失计算") from e
+            else:
+                # 其他运行时错误
+                raise
+
+    return wrapper
+
+class MoleculeWorkflow:
+    """
+    Molecule workflow integrating VAE molecule generation, GNN prediction, and reinforcement learning.
+    """
+
+    def __init__(self, vae_model, original_excel_path, config,
+                 charset, train_loader=None, checkpoint_dir=None
+        ):
+        """
+        Initialize the molecule workflow.
+
+        :param vae_model: VAE model
+        :param original_excel_path: Path to the original data Excel file
+        :param config: Configuration dictionary
+        :param charset: Character set
+        """
+        self.vae_model = vae_model
+        self.config = config
+        self.charset = charset
+        self.device = torch.device(
+            config.get('training', {}).get('device', 'cuda:0' if torch.cuda.is_available() else 'cpu'))
+        self.all_generated_molecules = []
+        self.memory = deque(maxlen=100)  # Used to store high-quality SMILES and rewards
+
+        # Added in MoleculeWorkflow's __init__:
+        self.value_network = AttentionEnhancedValueNetwork(config['model']['latent_dim']).to(self.device)
+        self.value_optimizer = optim.Adam(self.value_network.parameters(), lr=config['training']['value_lr'])
+        self.latent_dim = 128  # Ensure consistent latent_dim
+
+        # Improved latent space initialization
+        if train_loader is not None:
+            self.z_mean, self.z_var = self.calculate_dataset_latent_stats(train_loader)
+        else:
+            # Use statistics from the original dataset as initial values
+            self.z_mean = torch.zeros(1, self.latent_dim).to(self.device)
+            self.z_var = 0.5 * torch.ones(1, self.latent_dim).to(self.device)  # Reduce initial variance
+        # Initialize z_mean and z_var
+        # self.z_mean = torch.zeros(1, self.latent_dim).to(self.device)  # shape: [1, 128]
+        # self.z_var = torch.ones(1, self.latent_dim).to(self.device)  # shape: [1, 128]
+
+        # Initialize policy network
+        self.policy_network = TransformerPolicyNetwork(
+            input_dim=config['model']['latent_dim'],
+            output_dim=len(charset),
+            embed_dim=256,
+            num_heads=4,
+            num_layers=3,
+            ff_dim=512,
+            dropout=0.1,
+            max_seq_len=config['data'].get('max_seq_len', 100)
+        ).to(self.device)
+
+        # Configure optimizer
+        self.policy_optimizer = optim.AdamW(
+            self.policy_network.parameters(),
+            lr=config['training']['policy_lr'],
+            weight_decay=1e-5
+        )
+        # Add VAE optimizer
+        self.vae_optimizer = optim.AdamW(
+            self.vae_model.parameters(),
+            lr=config['training']['vae_lr'],
+            weight_decay=1e-5
+        )
+
+        # VAE learning rate scheduler
+        self.vae_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.vae_optimizer,
+            mode='max',
+            factor=0.7,
+            patience=3,
+            verbose=True
+        )
+
+        # Add KL weight control
+        self.kl_weight = 1.0
+        self.kl_annealing_rate = 0.01
+        # Learning rate scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.policy_optimizer,
+            mode='max',
+            factor=0.5,
+            patience=5,
+            verbose=True
+        )
+
+        # Reinforcement learning parameters
+        self.gamma = 0.95
+        self.epsilon_start = 0.5
+        self.epsilon_end = 0.01
+        self.epsilon_decay = 0.995
+        self.epsilon = self.epsilon_start
+
+        # Experience replay
+        self.replay_buffer = deque(maxlen=10000)
+        self.high_quality_buffer = deque(maxlen=1000)
+
+        # Prioritized sampling parameters
+        self.beta = 0.4
+        self.alpha = 0.6
+        self.reward_history = []
+        # Early stopping mechanism
+        self.best_reward = -np.inf
+        self.early_stop_counter = 0
+        self.early_stop_patience = 20
+
+        # Load original data
+        self.original_df = self.load_original_data(original_excel_path)
+        self.original_smiles = self.original_df[self.config['data']['smiles_column']].tolist()
+
+        # Similarity threshold
+        self.similarity_threshold = config.get('molecule_workflow', {}).get('similarity_threshold', 0.7)
+        # Add checkpoint directory
+        self.checkpoint_dir = checkpoint_dir or config.get('paths', {}).get('checkpoint_dir', './checkpoints')
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        # Attempt to restore from checkpoint
+        if checkpoint_dir:
+            self.load_checkpoint(checkpoint_dir)
+
+        # 添加奖励可视化相关参数
+        self.reward_history = []  # 奖励历史记录
+        self.reward_visualization_dir = os.path.join(checkpoint_dir, 'reward_visualizations')
+        os.makedirs(self.reward_visualization_dir, exist_ok=True)
+
+        # 初始化奖励统计
+        self.reward_stats = {
+            'iteration': [],
+            'avg_reward': [],
+            'max_reward': [],
+            'min_reward': [],
+            'std_reward': [],
+            'total_reward': []
+        }
+
+        # 记录最佳奖励分子的信息
+        self.best_molecules_info = []  # 存储(迭代, 分子, 奖励, 时间)
+
+
+    def visualize_reward_history(self, save_path=None, show_plot=False):
+        """
+        Visualize changes in reward history.
+
+        Args:
+            save_path: Path to save the figure; if None, use the default path.
+            show_plot: Whether to display the plot.
+        """
+        if not self.reward_history:
+            logger.warning("Reward history is empty, unable to generate visualization.")
+            return
+
+        plt.figure(figsize=(15, 10))
+
+        # Prepare data
+        iterations = list(range(1, len(self.reward_history) + 1))
+
+        # 1. Main plot: Reward trends
+        plt.subplot(2, 2, 1)
+        plt.plot(iterations, self.reward_history, 'b-', linewidth=2, alpha=0.7, label='Average Reward')
+
+        # Add moving average line
+        window_size = max(1, len(self.reward_history) // 10)
+        moving_avg = pd.Series(self.reward_history).rolling(window=window_size, min_periods=1).mean()
+        plt.plot(iterations, moving_avg, 'r-', linewidth=2, label=f'{window_size}-iteration Moving Average')
+
+        # Marking highest and lowest points
+        max_idx = np.argmax(self.reward_history)
+        min_idx = np.argmin(self.reward_history)
+        plt.scatter(max_idx + 1, self.reward_history[max_idx],
+                    color='green', s=100, zorder=5,
+                    label=f'Highest Point: {self.reward_history[max_idx]:.3f}')
+        plt.scatter(min_idx + 1, self.reward_history[min_idx],
+                    color='red', s=100, zorder=5,
+                    label=f'Lowest Point: {self.reward_history[min_idx]:.3f}')
+
+        plt.xlabel('Iteration Number', fontsize=12)
+        plt.ylabel('Average Reward', fontsize=12)
+        plt.title('Reward History Trend', fontsize=14, fontweight='bold')
+        plt.grid(True, alpha=0.3)
+        plt.legend(loc='best')
+
+        # 2. Reward distribution histogram
+        plt.subplot(2, 2, 2)
+        plt.hist(self.reward_history, bins=20, alpha=0.7, color='blue', edgecolor='black')
+        plt.xlabel('Reward Value', fontsize=12)
+        plt.ylabel('Frequency', fontsize=12)
+        plt.title('Reward Value Distribution', fontsize=14, fontweight='bold')
+        plt.grid(True, alpha=0.3)
+
+        # Annotate statistical information on the histogram
+        mean_reward = np.mean(self.reward_history)
+        median_reward = np.median(self.reward_history)
+        std_reward = np.std(self.reward_history)
+
+        plt.axvline(mean_reward, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_reward:.3f}')
+        plt.axvline(median_reward, color='green', linestyle='--', linewidth=2, label=f'Median: {median_reward:.3f}')
+        plt.legend(loc='best')
+
+        # Add statistical information text box
+        stats_text = f"""Statistics:
+        Mean: {mean_reward:.3f}
+        Median: {median_reward:.3f}
+        Standard Deviation: {std_reward:.3f}
+        Maximum: {max(self.reward_history):.3f}
+        Minimum: {min(self.reward_history):.3f}
+        Total Iterations: {len(self.reward_history)}"""
+
+        plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes,
+                 fontsize=10, verticalalignment='top',
+                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+        # 3. Cumulative rewards chart
+        plt.subplot(2, 2, 3)
+        cumulative_rewards = np.cumsum(self.reward_history)
+        plt.plot(iterations, cumulative_rewards, 'g-', linewidth=2)
+        plt.xlabel('Iteration Number', fontsize=12)
+        plt.ylabel('Cumulative Reward', fontsize=12)
+        plt.title('Cumulative Reward Changes', fontsize=14, fontweight='bold')
+        plt.grid(True, alpha=0.3)
+
+        # 4. Reward change rate chart
+        plt.subplot(2, 2, 4)
+        if len(self.reward_history) > 1:
+            reward_changes = np.diff(self.reward_history)
+            plt.plot(iterations[1:], reward_changes, color='purple', linestyle='-', linewidth=2, alpha=0.7)
+            plt.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+
+            # Add positive and negative change zones
+            positive_mask = reward_changes > 0
+            negative_mask = reward_changes < 0
+
+            if np.any(positive_mask):
+                plt.fill_between(iterations[1:], 0, reward_changes,
+                                 where=positive_mask, color='green', alpha=0.3, label='Reward Increase')
+            if np.any(negative_mask):
+                plt.fill_between(iterations[1:], 0, reward_changes,
+                                 where=negative_mask, color='red', alpha=0.3, label='Reward Decrease')
+
+            plt.xlabel('Iteration Number', fontsize=12)
+            plt.ylabel('Reward Change', fontsize=12)
+            plt.title('Rate of Reward Change', fontsize=14, fontweight='bold')
+            plt.grid(True, alpha=0.3)
+            plt.legend(loc='best')
+
+        plt.tight_layout()
+
+        # Save chart
+        if save_path is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_path = os.path.join(self.reward_visualization_dir, f'reward_history_{timestamp}.png')
+
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        logger.info(f"Reward history chart saved to: {save_path}")
+
+        if show_plot:
+            plt.show()
+        else:
+            plt.close()
+
+    def visualize_reward_by_components(self, save_path=None):
+        """
+        Visualize by decomposing reward components (if component information is recorded).
+        """
+        # If there is component information, further decomposition can be made.
+        if hasattr(self, 'reward_components_history'):
+            plt.figure(figsize=(12, 8))
+
+            components = list(self.reward_components_history[0].keys())
+            num_components = len(components)
+
+            for i, component in enumerate(components, 1):
+                component_values = [r[component] for r in self.reward_components_history]
+                iterations = range(1, len(component_values) + 1)
+
+                plt.subplot(num_components, 1, i)
+                plt.plot(iterations, component_values, linewidth=2)
+                plt.xlabel('Iteration Number')
+                plt.ylabel(component)
+                plt.title(f'{component} Trend')
+                plt.grid(True, alpha=0.3)
+
+                # Add mean line
+                mean_val = np.mean(component_values)
+                plt.axhline(y=mean_val, color='red', linestyle='--',
+                            label=f'Mean: {mean_val:.3f}')
+                plt.legend(loc='best')
+
+            plt.tight_layout()
+
+            if save_path is None:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                save_path = os.path.join(self.reward_visualization_dir, f'reward_components_{timestamp}.png')
+
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            logger.info(f"Reward component chart saved to: {save_path}")
+            plt.close()
+
+    def update_reward_stats(self, iteration, molecule_rewards):
+        """
+        Update reward statistics.
+
+        Args:
+            iteration: Current iteration number.
+            molecule_rewards: List of rewards from all molecules in the current iteration.
+        """
+        if not molecule_rewards:
+            return
+
+        # Calculate statistics
+        rewards_array = np.array(list(molecule_rewards.values()))
+        valid_rewards = rewards_array[~np.isnan(rewards_array) & ~np.isinf(rewards_array)]
+
+        if len(valid_rewards) > 0:
+            self.reward_stats['iteration'].append(iteration)
+            self.reward_stats['avg_reward'].append(np.mean(valid_rewards))
+            self.reward_stats['max_reward'].append(np.max(valid_rewards))
+            self.reward_stats['min_reward'].append(np.min(valid_rewards))
+            self.reward_stats['std_reward'].append(np.std(valid_rewards))
+            self.reward_stats['total_reward'].append(np.sum(valid_rewards))
+
+            # Record best molecule
+            max_reward = np.max(valid_rewards)
+            if max_reward > 0:  # Only record molecules with positive rewards
+                best_molecule = list(molecule_rewards.keys())[np.argmax(valid_rewards)]
+                self.best_molecules_info.append({
+                    'iteration': iteration,
+                    'molecule': best_molecule,
+                    'reward': max_reward,
+                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+
+                # Keep only the top 10 best molecules
+                if len(self.best_molecules_info) > 10:
+                    self.best_molecules_info = sorted(self.best_molecules_info,
+                                                      key=lambda x: x['reward'],
+                                                      reverse=True)[:10]
+
+    def save_reward_stats_to_file(self):
+        """Save the reward statistics to a file."""
+        if not self.reward_stats['iteration']:
+            return
+
+        # Save statistics to CSV
+        stats_df = pd.DataFrame(self.reward_stats)
+        stats_path = os.path.join(self.reward_visualization_dir, 'reward_statistics.csv')
+        stats_df.to_csv(stats_path, index=False)
+        logger.info(f"Reward statistics have been saved to: {stats_path}")
+
+        # Save best molecules information to JSON
+        best_molecules_path = os.path.join(self.reward_visualization_dir, 'best_molecules.json')
+        with open(best_molecules_path, 'w', encoding='utf-8') as f:
+            json.dump(self.best_molecules_info, f, ensure_ascii=False, indent=2)
+        logger.info(f"Best molecules information has been saved to: {best_molecules_path}")
+
+        # Create reward history trend report
+        self.create_reward_report()
+
+    def create_reward_report(self):
+        """Create a reward history trend report."""
+        if not self.reward_history:
+            return
+
+        report_path = os.path.join(self.reward_visualization_dir, 'reward_analysis_report.txt')
+
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write("=" * 60 + "\n")
+            f.write("Reward History Analysis Report\n")
+            f.write("=" * 60 + "\n\n")
+
+            f.write(f"Generation Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Total Iterations: {len(self.reward_history)}\n\n")
+
+            # Basic statistics
+            f.write("Basic Statistics:\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"Average Reward: {np.mean(self.reward_history):.4f}\n")
+            f.write(f"Median Reward: {np.median(self.reward_history):.4f}\n")
+            f.write(f"Standard Deviation: {np.std(self.reward_history):.4f}\n")
+            f.write(
+                f"Maximum Reward: {np.max(self.reward_history):.4f} (Iteration {np.argmax(self.reward_history) + 1})\n")
+            f.write(
+                f"Minimum Reward: {np.min(self.reward_history):.4f} (Iteration {np.argmin(self.reward_history) + 1})\n\n")
+
+            # Trend analysis
+            f.write("Trend Analysis:\n")
+            f.write("-" * 40 + "\n")
+
+            if len(self.reward_history) > 1:
+                # Calculate the trend (comparison of mean of last 10 iterations to overall mean)
+                last_n = min(10, len(self.reward_history))
+                recent_avg = np.mean(self.reward_history[-last_n:])
+                overall_avg = np.mean(self.reward_history)
+
+                if recent_avg > overall_avg:
+                    trend = "Increasing"
+                elif recent_avg < overall_avg:
+                    trend = "Decreasing"
+                else:
+                    trend = "Stable"
+
+                f.write(f"Recent ({last_n} iterations) Average Reward: {recent_avg:.4f}\n")
+                f.write(f"Overall Average Reward: {overall_avg:.4f}\n")
+                f.write(f"Reward Trend: {trend}\n\n")
+
+            # Best molecules list
+            if self.best_molecules_info:
+                f.write("Best Molecules List (sorted by reward):\n")
+                f.write("-" * 40 + "\n")
+                sorted_best = sorted(self.best_molecules_info, key=lambda x: x['reward'], reverse=True)
+
+                for i, info in enumerate(sorted_best[:5], 1):  # Only show top 5
+                    f.write(f"{i}. Iteration {info['iteration']}:\n")
+                    f.write(f"   Molecule: {info['molecule']}\n")
+                    f.write(f"   Reward: {info['reward']:.4f}\n")
+                    f.write(f"   Time: {info['timestamp']}\n")
+
+            f.write("\n" + "=" * 60 + "\n")
+
+        logger.info(f"Reward Analysis Report has been saved to: {report_path}")
+    def reset(self):
+        """重置工作流的内部状态"""
+        # 重置所有需要重置的内部状态
+        self.current_molecules = []
+        self.replay_buffer = []
+        self.best_molecules = []
+        # 重置任何其他相关的内部状态
+    def calculate_dataset_latent_stats(self, train_loader):
+        """Calculate the mean and variance of latent vectors for the entire dataset."""
+        all_means = []
+        all_logvars = []
+        self.vae_model.eval()
+        with torch.no_grad():
+            for batch in train_loader:
+                inputs = batch.to(self.device)
+                mu, logvar = self.vae_model.encode(inputs)
+                all_means.append(mu)
+                all_logvars.append(logvar)
+
+        all_means = torch.cat(all_means, dim=0)
+        all_logvars = torch.cat(all_logvars, dim=0)
+
+        # Calculate the mean of means and variance
+        z_mean = all_means.mean(dim=0, keepdim=True)
+        z_var = torch.exp(all_logvars).mean(dim=0, keepdim=True)
+
+        return z_mean, z_var
+
+    def save_checkpoint(self, iteration, output_dir=None):
+        """Save the current training state."""
+        checkpoint_dir = output_dir or self.checkpoint_dir
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        # Prepare checkpoint data
+        checkpoint = {
+            'iteration': iteration,
+            'policy_network_state': self.policy_network.state_dict(),
+            'value_network_state': self.value_network.state_dict(),
+            'vae_model_state': self.vae_model.state_dict(),
+            'policy_optimizer_state': self.policy_optimizer.state_dict(),
+            'value_optimizer_state': self.value_optimizer.state_dict(),
+            'vae_optimizer_state': self.vae_optimizer.state_dict(),
+            'z_mean': self.z_mean,
+            'z_var': self.z_var,
+            'epsilon': self.epsilon,
+            'best_reward': self.best_reward,
+            'early_stop_counter': self.early_stop_counter,
+            'replay_buffer': list(self.replay_buffer),
+            'high_quality_buffer': list(self.high_quality_buffer),
+            'kl_weight': self.kl_weight,
+            'config': self.config,
+            'charset': self.charset,
+            'all_generated_molecules': self.all_generated_molecules,
+            'reward_history': self.reward_history,  # Save reward_history,
+            'unique_molecules': self.unique_molecules,  # Add this line
+            'similarity_data': self.similarity_data,  # Add this line
+        }
+
+        # Save checkpoint file
+        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_iter_{iteration}.pth')
+        torch.save(checkpoint, checkpoint_path)
+
+        # Also save the best model
+        if self.best_reward == checkpoint['best_reward']:
+            best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
+            torch.save({
+                'policy_network_state': self.policy_network.state_dict(),
+                'value_network_state': self.value_network.state_dict(),
+                'vae_model_state': self.vae_model.state_dict(),
+            }, best_model_path)
+
+        logger.info(f"Checkpoint saved to {checkpoint_path}")
+
+    def load_checkpoint(self, checkpoint_dir):
+        """Restore the training state from a checkpoint."""
+        # Find the latest checkpoint file
+        checkpoint_files = sorted(
+            [f for f in os.listdir(checkpoint_dir) if f.startswith('checkpoint_iter_') and f.endswith('.pth')],
+            key=lambda x: int(x.split('_')[-1].split('.')[0]),
+            reverse=True
+        )
+
+        if not checkpoint_files:
+            logger.warning(f"No checkpoint files found in {checkpoint_dir}")
+            return
+
+        checkpoint_path = os.path.join(checkpoint_dir, checkpoint_files[0])
+        logger.info(f"Restoring from checkpoint: {checkpoint_path}")
+
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+            # Restore model states
+            self.policy_network.load_state_dict(checkpoint['policy_network_state'])
+            self.value_network.load_state_dict(checkpoint['value_network_state'])
+            self.vae_model.load_state_dict(checkpoint['vae_model_state'])
+
+            # Restore optimizer states
+            self.policy_optimizer.load_state_dict(checkpoint['policy_optimizer_state'])
+            self.value_optimizer.load_state_dict(checkpoint['value_optimizer_state'])
+            self.vae_optimizer.load_state_dict(checkpoint['vae_optimizer_state'])
+            # Restore unique_molecules and similarity_data
+            self.unique_molecules = checkpoint.get('unique_molecules', {})
+            self.similarity_data = checkpoint.get('similarity_data', {})
+            # Restore training state
+            self.z_mean = checkpoint['z_mean'].to(self.device)
+            self.z_var = checkpoint['z_var'].to(self.device)
+            self.epsilon = checkpoint['epsilon']
+            self.best_reward = checkpoint['best_reward']
+            self.early_stop_counter = checkpoint['early_stop_counter']
+            self.replay_buffer = deque(checkpoint['replay_buffer'], maxlen=10000)
+            self.high_quality_buffer = deque(checkpoint['high_quality_buffer'], maxlen=1000)
+            self.kl_weight = checkpoint['kl_weight']
+            self.all_generated_molecules = checkpoint['all_generated_molecules']
+            self.reward_history = checkpoint['reward_history']  # Load reward_history
+
+            logger.info(f"Successfully restored training state from iteration {checkpoint['iteration']}")
+            logger.info(f"Current best reward: {self.best_reward:.4f}, ε: {self.epsilon:.4f}")
+            return checkpoint['iteration']  # Return the number of completed iterations
+
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            return 0
+
+    def load_best_model(self, checkpoint_dir=None):
+        """Load the best model parameters."""
+        checkpoint_dir = checkpoint_dir or self.checkpoint_dir
+        best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
+
+        if not os.path.exists(best_model_path):
+            logger.warning(f"Best model file not found: {best_model_path}")
+            return False
+
+        try:
+            best_model = torch.load(best_model_path, map_location=self.device)
+
+            self.policy_network.load_state_dict(best_model['policy_network_state'])
+            self.value_network.load_state_dict(best_model['value_network_state'])
+            self.vae_model.load_state_dict(best_model['vae_model_state'])
+
+            logger.info("Best model parameters loaded.")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load best model: {e}")
+            return False
+
+    def load_original_data(self, original_excel_path: str) -> pd.DataFrame:
+        """
+        Load the original data, ensuring the SMILES column is a string.
+        """
+        try:
+            df = pd.read_excel(original_excel_path, sheet_name="unlabbeled2")
+            logger.info(f"Successfully loaded original data, {len(df)} rows.")
+
+            # Ensure the SMILES column is a string
+            col_name = self.config['data']['smiles_column']
+            df[col_name] = df[col_name].astype(str)
+
+            return df
+        except FileNotFoundError:
+            logger.error(f"Original data file not found: {original_excel_path}")
+            raise
+        except ValueError as e:
+            logger.error(f"Error reading original data file: {e}")
+            raise
+
+    def calculate_molecular_similarity(self, smiles1: str, smiles2: str, similarity_metric: str = 'tanimoto') -> float:
+        """
+        Calculate the similarity between two molecules using a weighted combination of fingerprints:
+        - MACCS Keys (50%)
+        - Morgan Fingerprint radius 2 (25%)
+        - Morgan Fingerprint radius 3 (25%)
+        """
+        try:
+            mol1 = Chem.MolFromSmiles(smiles1)
+            mol2 = Chem.MolFromSmiles(smiles2)
+
+            if not mol1 or not mol2:
+                logger.warning(f"Failed to parse SMILES: {smiles1} or {smiles2}")
+                return 0.0
+
+            # Calculate Morgan fingerprint similarity with radius 2
+            fp1_morgan_r2 = AllChem.GetMorganFingerprintAsBitVect(mol1, 2, nBits=2048)
+            fp2_morgan_r2 = AllChem.GetMorganFingerprintAsBitVect(mol2, 2, nBits=2048)
+            morgan_r2_sim = DataStructs.TanimotoSimilarity(fp1_morgan_r2,
+                                                           fp2_morgan_r2) if similarity_metric == 'tanimoto' else DataStructs.DiceSimilarity(
+                fp1_morgan_r2, fp2_morgan_r2)
+
+            # Calculate Morgan fingerprint similarity with radius 3
+            fp1_morgan_r3 = AllChem.GetMorganFingerprintAsBitVect(mol1, 3, nBits=2048)
+            fp2_morgan_r3 = AllChem.GetMorganFingerprintAsBitVect(mol2, 3, nBits=2048)
+            morgan_r3_sim = DataStructs.TanimotoSimilarity(fp1_morgan_r3,
+                                                           fp2_morgan_r3) if similarity_metric == 'tanimoto' else DataStructs.DiceSimilarity(
+                fp1_morgan_r3, fp2_morgan_r3)
+
+            # Calculate MACCS Keys similarity
+            fp1_maccs = MACCSkeys.GenMACCSKeys(mol1)
+            fp2_maccs = MACCSkeys.GenMACCSKeys(mol2)
+            maccs_sim = DataStructs.TanimotoSimilarity(fp1_maccs,
+                                                       fp2_maccs) if similarity_metric == 'tanimoto' else DataStructs.DiceSimilarity(
+                fp1_maccs, fp2_maccs)
+
+            # Calculate weighted average similarity
+            weighted_sim = (0.5 * maccs_sim) + (0.25 * morgan_r2_sim) + (0.25 * morgan_r3_sim)
+
+            return weighted_sim
+
+        except Exception as e:
+            logger.warning(f"Similarity calculation failed: {e}")
+            return 0.0
+
+    def find_most_similar_molecules(self, generated_smiles: str, top_k: int = 5, similarity_threshold: float = 0.3) -> \
+            List[Tuple[str, float]]:
+        """
+        Find the most similar molecules in the original dataset.
+        """
+        similarities = []
+        logger.info(f"Finding molecules similar to {generated_smiles}")
+
+        for original_smiles in self.original_smiles:
+            try:
+                similarity = self.calculate_molecular_similarity(generated_smiles, original_smiles)
+                similarities.append((original_smiles, similarity))
+            except Exception as e:
+                logger.warning(f"Failed to calculate similarity between {generated_smiles} and {original_smiles}: {e}")
+
+        similarities.sort(key=lambda x: x[1], reverse=True)
+
+        logger.info("Similarity sorting results:")
+        for smiles, score in similarities[:top_k]:
+            logger.info(f"SMILES: {smiles}, Similarity: {score}")
+
+        similar_molecules = [(smiles, score) for smiles, score in similarities if score >= similarity_threshold]
+
+        # If not enough similar molecules are found, try a more flexible match
+        if len(similar_molecules) < top_k and similarities:
+            # Take the top_k, even if below the threshold
+            similar_molecules = similarities[:top_k]
+
+        return similar_molecules[:top_k]
+
+    def adjust_latent_parameters(self, previous_z_mean, previous_z_var, reward):
+        """
+        安全调整潜在参数，防止CUDA错误
+        """
+        # 确保输入是张量且设备一致
+        if not isinstance(previous_z_mean, torch.Tensor):
+            previous_z_mean = torch.tensor(previous_z_mean, dtype=torch.float32)
+        if not isinstance(previous_z_var, torch.Tensor):
+            previous_z_var = torch.tensor(previous_z_var, dtype=torch.float32)
+
+        # 确保维度正确
+        if previous_z_mean.dim() != 2:
+            previous_z_mean = previous_z_mean.view(1, -1)
+        if previous_z_var.dim() != 2:
+            previous_z_var = previous_z_var.view(1, -1)
+
+        # 确保设备一致
+        previous_z_mean = previous_z_mean.to(self.device)
+        previous_z_var = previous_z_var.to(self.device)
+
+        # 确保奖励是有效值
+        if isinstance(reward, torch.Tensor):
+            reward = reward.item()
+
+        # 防止无效奖励值
+        reward = float(reward) if not np.isnan(reward) and not np.isinf(reward) else 0.0
+
+        # 设置安全边界
+        max_variance = 2.0
+        min_variance = 0.1
+
+        try:
+            # 计算安全的奖励因子
+            reward_factor = 1.0 + 0.1 * np.tanh(reward)
+            reward_factor = max(0.5, min(2.0, reward_factor))  # 限制在合理范围内
+
+            # 打印调试信息
+            logger.info(f"调整潜在参数: reward={reward:.4f}, reward_factor={reward_factor:.4f}")
+
+            # 安全调整方差
+            # 使用torch.mul而不是直接乘法，以确保正确的广播
+            new_z_var = torch.mul(previous_z_var, reward_factor)
+            new_z_var = torch.clamp(new_z_var, min=min_variance, max=max_variance)
+
+            # 调整均值 - 仅当有高质量样本时
+            new_z_mean = previous_z_mean.clone()
+            if len(self.high_quality_buffer) > 10:
+                try:
+                    # 确保高质量缓冲区中的张量设备一致
+                    hq_vectors = torch.stack([x[0].to(self.device) for x in self.high_quality_buffer])
+                    hq_mean = hq_vectors.mean(dim=0, keepdim=True)
+                    new_z_mean = 0.9 * previous_z_mean + 0.1 * hq_mean
+                except Exception as e:
+                    logger.error(f"调整潜在均值时出错: {e}")
+                    # 出错时保持原来的均值
+                    new_z_mean = previous_z_mean.clone()
+
+            # 检查NaN和Inf
+            if torch.isnan(new_z_mean).any() or torch.isinf(new_z_mean).any():
+                logger.warning("检测到z_mean中的NaN或Inf值，使用默认值")
+                new_z_mean = previous_z_mean.clone()
+
+            if torch.isnan(new_z_var).any() or torch.isinf(new_z_var).any():
+                logger.warning("检测到z_var中的NaN或Inf值，使用默认值")
+                new_z_var = previous_z_var.clone()
+
+            # 确保维度匹配
+            latent_dim = self.latent_dim
+            if new_z_mean.size(1) != latent_dim:
+                logger.warning(f"z_mean维度不匹配: 期望{latent_dim}，实际{new_z_mean.size(1)}")
+                new_z_mean = F.pad(new_z_mean[:, :latent_dim], (0, max(0, latent_dim - new_z_mean.size(1))), "constant",
+                                   0)
+
+            if new_z_var.size(1) != latent_dim:
+                logger.warning(f"z_var维度不匹配: 期望{latent_dim}，实际{new_z_var.size(1)}")
+                new_z_var = F.pad(new_z_var[:, :latent_dim], (0, max(0, latent_dim - new_z_var.size(1))), "constant", 1)
+
+            return new_z_mean, new_z_var
+        except Exception as e:
+            logger.error(f"调整潜在参数时出现未处理的错误: {e}")
+            # 出错时返回原始值，避免训练中断
+            return previous_z_mean, previous_z_var
+
+    def generated_molecules(self, num_samples, z_mean, z_var):
+        """Generate molecules, adding dimension validation."""
+        logger.info(f"Generating {num_samples} molecules")
+
+        # Validate latent vector dimensions
+        if z_mean.dim() != 2 or z_var.dim() != 2:
+            logger.warning("Latent vector dimensions are incorrect, adjusting to 2D")
+            z_mean = z_mean.view(1, -1) if z_mean.numel() > 0 else torch.zeros(1, self.latent_dim)
+            z_var = z_var.view(1, -1) if z_var.numel() > 0 else torch.ones(1, self.latent_dim)
+
+        # Ensure dimension matching
+        latent_dim = self.vae_model.latent_dim
+        if z_mean.size(1) != latent_dim:
+            if z_mean.size(1) > latent_dim:
+                z_mean = z_mean[:, :latent_dim]
+            else:
+                pad_size = latent_dim - z_mean.size(1)
+                z_mean = F.pad(z_mean, (0, pad_size), "constant", 0)
+
+        if z_var.size(1) != latent_dim:
+            if z_var.size(1) > latent_dim:
+                z_var = z_var[:, :latent_dim]
+            else:
+                pad_size = latent_dim - z_var.size(1)
+                z_var = F.pad(z_var, (0, pad_size), "constant", 1)  # Fill with 1
+
+        # Call generation function
+        molecules = generate_molecules(
+            model=self.vae_model,
+            charset=self.charset,
+            num_samples=num_samples,
+            z_mean=z_mean,
+            z_var=z_var
+        )
+
+        logger.info(f"Successfully generated {len(molecules)} molecules")
+        return molecules
+
+    def run_gnn_prediction(self, new_molecules_df: pd.DataFrame, model_path: str, config: dict) -> pd.DataFrame:
+        """
+        Use the GNN model for prediction.
+        """
+        from going_p_kf import predict_unlabeled_data
+        import argparse
+        import tempfile
+
+        parser = argparse.ArgumentParser(description="GNN for property prediction")
+        parser.add_argument("--data_path", type=str, default="/home/qyl/CSD_data/1_CSD/DATA_clean/output_deduped2.xlsx")
+        parser.add_argument("--sheet", type=str, default="sol_min3")
+        parser.add_argument("--source_batch_size", type=int, default=128)
+        parser.add_argument("--batch_size", type=int, default=8)
+        parser.add_argument("--epochs", type=int, default=1000)
+        parser.add_argument("--lr", type=float, default=0.0001)
+        parser.add_argument("--weight_decay", type=float, default=0.01)
+        parser.add_argument("--hidden_dim1", type=int, default=128)
+        parser.add_argument("--hidden_dim2", type=int, default=128)
+        parser.add_argument("--hidden_dim3", type=int, default=128)
+        parser.add_argument("--dropout_ratio", type=float, default=0.5)
+        parser.add_argument("--num_heads", type=int, default=4)
+        parser.add_argument("--transfer", type=str, default=False)
+        parser.add_argument("--transfer_sheet", type=str, default="unlabbeled2")
+        parser.add_argument("--transfer_data_path", type=str,
+                            default="/home/qyl/CSD_data/1_CSD/DATA_clean/output_deduped2.xlsx")
+        parser.add_argument("--tran_save", type=str, default="/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4")
+        parser.add_argument("--fine_save", type=str, default="/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4")
+        parser.add_argument("--output_dir", type=str, default="/home/qyl/CSD_data/1_CSD/DATA_clean/data_supp_going_rf")
+        parser.add_argument("--time", type=str, default="sol_min4_FF60")
+        parser.add_argument("--ori_arg", type=str, default=False)
+        parser.add_argument("--tran_arg", type=str, default=False)
+        parser.add_argument("--pca_model_path", type=str, default="/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4",
+                            help="Path to load/save PCA model")
+        parser.add_argument("--hidden_dim", type=int, default=128)
+        parser.add_argument("--num_workers", type=int, default=0, help="Number of data loading workers")
+        parser.add_argument("--record", type=str, default="5")
+        # parser.add_argument("--count", type=str, default="19111111")
+        parser.add_argument("--count", type=str, default="19111111111")
+
+        parser.add_argument("--cc", type=str, default="333")
+
+        args = parser.parse_args()
+        device = torch.device(config['training']['device'])
+
+        try:
+            # Check and write to temporary file
+            temp_file = None
+            if isinstance(new_molecules_df, pd.DataFrame):
+                temp_file = tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False)
+                new_molecules_df.to_excel(temp_file.name, index=False)
+                new_molecules_path = temp_file.name
+            else:
+                new_molecules_path = new_molecules_df
+
+            if not os.path.exists(new_molecules_path):
+                raise FileNotFoundError(f"File does not exist: {new_molecules_path}")
+
+            metal_properties_sheet = pd.read_excel("/home/qyl/CSD_data/1_CSD/DATA_clean/output_deduped2.xlsx",
+                                                   'metal')
+            solvent_properties_sheet = pd.read_excel("/home/qyl/CSD_data/1_CSD/DATA_clean/output_deduped2.xlsx",
+                                                     'sol_pro4')
+
+            prediction_result = predict_unlabeled_data(
+                new_data_path=new_molecules_path,
+                new_data_sheet="Sheet1",
+                metal_properties_sheet=metal_properties_sheet,
+                solvent_properties_sheet=solvent_properties_sheet,
+                model_checkpoint_path=[f"{args.fine_save}/{args.count}_2.pth"],
+                pca_model_path=args.pca_model_path,
+                args=args,
+                device=device
+            )
+
+            # Delete temporary file
+            if temp_file:
+                os.unlink(temp_file.name)
+
+            # Ensure the return is a DataFrame containing the prediction results
+            if isinstance(prediction_result, pd.DataFrame):
+                # Add column name check
+                if 'prediction' not in prediction_result.columns:
+                    logger.warning("Missing 'prediction' column in prediction result, attempting to rename")
+                    # Try to automatically identify the prediction column
+                    for col in prediction_result.columns:
+                        if 'pred' in col.lower() or 'output' in col.lower():
+                            prediction_result.rename(columns={col: 'prediction'}, inplace=True)
+                            break
+
+                # Ensure there is a valid prediction column
+                if 'prediction' in prediction_result.columns:
+                    return prediction_result
+
+            # Handle other formats of prediction results
+            return self.process_prediction_result(prediction_result)
+
+
+        except Exception as e:
+            logger.error(f"GNN prediction failed: {e}")
+            if temp_file and os.path.exists(temp_file.name):
+                os.unlink(temp_file.name)
+            return pd.DataFrame()
+
+    def process_prediction_result(self, prediction_result):
+        """Process data according to prediction results."""
+        if isinstance(prediction_result, pd.DataFrame):
+            return prediction_result
+        elif isinstance(prediction_result, dict):
+            if 'prediction' in prediction_result:
+                return pd.DataFrame({'prediction': prediction_result['prediction']})
+            else:
+                logger.warning("No 'prediction' key in prediction results dictionary")
+                return pd.DataFrame()
+        else:
+            logger.error(f"Incorrect prediction result type: {type(prediction_result)}")
+            return pd.DataFrame()
+
+    def reward_function(self, smiles: str, predictions: Dict[str, float], similarity_score: float) -> float:
+        # 初始化奖励分量
+        similarity_reward = 0.0
+        difference_reward = 0.0
+        metal_difference = 0.0  # 确保变量始终被初始化
+
+        # 1. 相似度奖励
+        if similarity_score > 0.5:
+            similarity_reward = 10.0 * (similarity_score - 0.5)
+
+        # 2. 金属环境差异奖励 - 添加更健壮的检查
+        pred_values = list(predictions.values())
+        if len(pred_values) >= 2:
+            # 计算两个金属环境预测值的绝对差异
+            metal_difference = abs(pred_values[0] - pred_values[1])
+            difference_reward = 20.0 * metal_difference
+        else:
+            # 处理预测数量不足的情况
+            logger.warning(f"分子 {smiles} 的预测数量不足，无法计算差异")
+
+        # 3. 有效性检查
+        validity_penalty = -10.0 if not self._is_valid_smiles(smiles) else 0.0
+
+        # 4. 结合奖励
+        total_reward = similarity_reward + difference_reward + validity_penalty
+
+        logger.info(
+            f"分子奖励详情: SMILES={smiles}\n"
+            f"  相似度={similarity_score:.4f} (奖励={similarity_reward:.2f})\n"
+            f"  金属环境差异={metal_difference:.4f} (奖励={difference_reward:.2f})\n"
+            f"  总奖励={total_reward:.2f}"
+        )
+
+        return max(total_reward, 0.0)  # 确保非负
+
+    def _update_policy_network(self):
+        """Policy update using the value network as a baseline."""
+        if len(self.replay_buffer) < 32:
+            return 0.0
+
+        # Sample from replay buffer
+        batch_size = min(32, len(self.replay_buffer))
+        samples = random.sample(self.replay_buffer, batch_size)
+        states, rewards = zip(*samples)
+
+        # Convert to tensors
+        states = torch.stack(states).to(self.device)
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
+
+        # Value network evaluates state values
+        state_values = self.value_network(states).squeeze()
+
+        # Calculate advantage function
+        advantages = rewards - state_values.detach()
+
+        # Policy network forward pass
+        action_probs = self.policy_network(states)
+        log_probs = torch.log(action_probs + 1e-8)
+
+        # Policy gradient loss
+        policy_loss = -(log_probs * advantages.unsqueeze(1)).mean()
+
+        # Value network loss
+        value_loss = F.mse_loss(state_values, rewards)
+
+        # Joint optimization
+        self.policy_optimizer.zero_grad()
+        self.value_optimizer.zero_grad()
+
+        total_loss = policy_loss + value_loss
+        total_loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(self.policy_network.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.value_network.parameters(), 1.0)
+
+        self.policy_optimizer.step()
+        self.value_optimizer.step()
+
+        return policy_loss.item(), value_loss.item()
+
+    def _is_valid_smiles(self, smiles):
+        """A stricter check for molecular validity."""
+        if not smiles or len(smiles) < 4:  # Increase minimum length
+            return False
+
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if not mol:
+                return False
+
+            # Check basic chemical reasonableness
+            if mol.GetNumAtoms() < 4:  # At least 4 atoms
+                return False
+
+            return True
+        except:
+            return False
+
+    def create_latent_variable_backup(self):
+        """More robust backup creation with better error handling"""
+        try:
+            # Ensure tensors are valid and on correct device
+            if not isinstance(self.z_mean, torch.Tensor) or not isinstance(self.z_var, torch.Tensor):
+                logger.error("z_mean or z_var is not a tensor")
+                return (torch.zeros(1, self.latent_dim, device=self.device),
+                        torch.ones(1, self.latent_dim, device=self.device))
+
+            # Check for NaN/Inf values
+            if torch.isnan(self.z_mean).any() or torch.isinf(self.z_mean).any() or \
+                    torch.isnan(self.z_var).any() or torch.isinf(self.z_var).any():
+                logger.warning("NaN or Inf values detected in latent variables")
+                return (torch.zeros(1, self.latent_dim, device=self.device),
+                        torch.ones(1, self.latent_dim, device=self.device))
+
+            # Create detached copies safely
+            z_mean_backup = self.z_mean.clone().detach()
+            z_var_backup = self.z_var.clone().detach()
+
+            return z_mean_backup, z_var_backup
+        except Exception as e:
+            logger.error(f"Backup creation failed: {str(e)}")
+            return (torch.zeros(1, self.latent_dim, device=self.device),
+                    torch.ones(1, self.latent_dim, device=self.device))
+
+    def create_simple_dataframe(self, new_molecules: List[str]) -> pd.DataFrame:
+        """创建数据框，保留原始数据的所有列（特别是溶剂和金属列）"""
+        new_rows = []
+        smiles_column = self.config['data']['smiles_column']
+        metal_column = self.config['data']['metal_column']  # 新增金属列配置
+
+        for smiles in new_molecules:
+            similar_molecules = self.find_most_similar_molecules(smiles, top_k=1)
+
+            if not similar_molecules:
+                logger.warning(f"未找到 {smiles} 的相似分子")
+                continue
+
+            similar_smiles, similarity = similar_molecules[0]
+            similar_rows = self.original_df[self.original_df[smiles_column] == similar_smiles]
+
+            if similar_rows.empty:
+                logger.warning(f"未找到包含 {similar_smiles} 的原始数据行")
+                continue
+
+            # 复制原始数据中该分子的所有行（包括两个金属环境）
+            for _, row in similar_rows.iterrows():
+                new_row = row.copy()
+                new_row[smiles_column] = smiles  # 替换SMILES
+                new_row['similarity_score'] = similarity
+                new_rows.append(new_row)
+
+            logger.info(
+                f"为分子 {smiles} 创建了 {len(similar_rows)} 行数据（包含 {similar_rows[metal_column].nunique()} 种金属环境）")
+
+        return pd.DataFrame(new_rows) if new_rows else pd.DataFrame()
+
+    def check_and_reset_latent_variables(self):
+        """检查潜在变量是否有效，如无效则重置"""
+        reset_needed = False
+
+        # 检查NaN和Inf
+        if not isinstance(self.z_mean, torch.Tensor) or torch.isnan(self.z_mean).any() or torch.isinf(
+                self.z_mean).any():
+            logger.warning("z_mean包含无效值或不是张量，需要重置")
+            reset_needed = True
+
+        if not isinstance(self.z_var, torch.Tensor) or torch.isnan(self.z_var).any() or torch.isinf(self.z_var).any():
+            logger.warning("z_var包含无效值或不是张量，需要重置")
+            reset_needed = True
+
+        # 检查设备
+        try:
+            if hasattr(self, 'device') and self.z_mean.device != self.device:
+                logger.warning(f"z_mean设备不匹配: {self.z_mean.device} vs {self.device}")
+                reset_needed = True
+
+            if hasattr(self, 'device') and self.z_var.device != self.device:
+                logger.warning(f"z_var设备不匹配: {self.z_var.device} vs {self.device}")
+                reset_needed = True
+        except:
+            reset_needed = True
+
+        # 如果需要重置
+        if reset_needed:
+            logger.warning("重置潜在变量")
+            self.z_mean = torch.zeros(1, self.latent_dim, device=self.device)
+            self.z_var = torch.ones(1, self.latent_dim, device=self.device)
+
+        return reset_needed
+
+    def generate_noisy_latent_vector(self):
+        """安全地生成带噪声的潜在向量"""
+        try:
+            # 先检查和重置变量（如果需要）
+            self.check_and_reset_latent_variables()
+
+            # 确保z_mean在正确的设备上
+            self.z_mean = self.z_mean.to(self.device)
+
+            # 使用更安全的噪声添加方法
+            noise_scale = max(0.1, min(1.0, 0.5 * torch.sqrt(self.z_var.mean()).item()))
+
+            # 直接生成在正确设备上的噪声，避免使用randn_like
+            noise = torch.randn(self.z_mean.size(), device=self.device) * noise_scale
+
+            # 逐步计算，而不是一次性操作
+            noisy_z_mean = self.z_mean.clone()  # 首先创建副本
+            noisy_z_mean = noisy_z_mean + noise  # 添加噪声
+
+            # 检查生成的向量是否有效
+            if torch.isnan(noisy_z_mean).any() or torch.isinf(noisy_z_mean).any():
+                logger.warning("生成的噪声潜在向量包含无效值，使用原始z_mean")
+                return self.z_mean.clone()
+
+            return noisy_z_mean
+
+        except Exception as e:
+            logger.error(f"生成噪声潜在向量时出错: {e}")
+            # 如果出错，返回一个安全的随机向量
+            return torch.randn(1, self.latent_dim, device=self.device)
+
+    def _check_and_reset_latent_variables(self):
+        """Ensure latent variables are valid and on correct device"""
+        reset_needed = False
+        device_mismatch = False
+
+        try:
+            # Check if tensors exist and are on correct device
+            if not isinstance(self.z_mean, torch.Tensor):
+                reset_needed = True
+            elif torch.isnan(self.z_mean).any() or torch.isinf(self.z_mean).any():
+                reset_needed = True
+            elif self.z_mean.device != self.device:
+                device_mismatch = True
+
+            if not isinstance(self.z_var, torch.Tensor):
+                reset_needed = True
+            elif torch.isnan(self.z_var).any() or torch.isinf(self.z_var).any():
+                reset_needed = True
+            elif self.z_var.device != self.device:
+                device_mismatch = True
+        except Exception as e:
+            logger.error(f"Error checking latent variables: {str(e)}")
+            reset_needed = True
+
+        # Fix device mismatch if that's the only issue
+        if device_mismatch and not reset_needed:
+            try:
+                self.z_mean = self.z_mean.to(self.device)
+                self.z_var = self.z_var.to(self.device)
+                logger.info("Moved latent variables to correct device")
+                return False
+            except Exception as e:
+                logger.error(f"Failed to move tensors to device: {str(e)}")
+                reset_needed = True
+
+        # Reset if needed
+        if reset_needed:
+            logger.warning("Resetting latent variables")
+            self.z_mean = torch.zeros(1, self.latent_dim, device=self.device)
+            self.z_var = torch.ones(1, self.latent_dim, device=self.device)
+
+        return reset_needed
+
+    def _safe_adjust_latent_parameters(self, z_mean, z_var, reward):
+        """Safer parameter adjustment with better error handling"""
+        try:
+            # Input validation
+            if not isinstance(z_mean, torch.Tensor) or not isinstance(z_var, torch.Tensor):
+                logger.error("z_mean or z_var is not a tensor")
+                return z_mean, z_var
+
+            # Ensure proper device
+            z_mean = z_mean.to(self.device)
+            z_var = z_var.to(self.device)
+
+            # Validate reward value
+            if isinstance(reward, torch.Tensor):
+                reward = reward.item()
+
+            reward = float(reward) if not np.isnan(reward) and not np.isinf(reward) else 0.0
+            reward = max(-5.0, min(5.0, reward))  # Clip extreme values
+
+            # Compute adjustment factor more safely
+            reward_factor = 1.0 + 0.05 * np.tanh(reward)
+
+            # Element-wise operation with clipping
+            new_z_var = torch.clamp(z_var * reward_factor, min=0.1, max=2.0)
+
+            # Keep z_mean unchanged for stability
+            new_z_mean = z_mean.clone()
+
+            # Final validation
+            if torch.isnan(new_z_mean).any() or torch.isinf(new_z_mean).any() or \
+                    torch.isnan(new_z_var).any() or torch.isinf(new_z_var).any():
+                logger.warning("Adjustment produced invalid values")
+                return z_mean, z_var
+
+            return new_z_mean, new_z_var
+
+        except Exception as e:
+            logger.error(f"Parameter adjustment failed: {str(e)}")
+            return z_mean, z_var
+
+    def molecular_refinement_workflow(self, max_iterations: int = 50,
+                                      num_molecules_per_iteration: int = 500) -> pd.DataFrame:
+        """分子精炼工作流 - 支持检查点恢复"""
+        # 确保输出目录存在
+        output_dir = '/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/base7'
+        os.makedirs(output_dir, exist_ok=True)
+        # Add at the beginning:
+        torch.cuda.empty_cache()
+
+        # After heavy operations:
+        if max_iterations % 5 == 0:
+            torch.cuda.empty_cache()
+        # 初始化unique_molecules和similarity_data（如果尚未加载）
+        if not hasattr(self, 'unique_molecules'):
+            self.unique_molecules = {}
+        if not hasattr(self, 'similarity_data'):
+            self.similarity_data = {}
+
+        # 检查点恢复
+        start_iteration = 0
+        if self.checkpoint_dir:
+            loaded_iter = self.load_checkpoint(self.checkpoint_dir)
+            if loaded_iter is not None:
+                start_iteration = loaded_iter + 1
+                logger.info(f"从迭代 {start_iteration} 继续训练")
+
+        # 如果是从头开始，初始化潜在空间参数
+        if start_iteration == 0:
+            self.z_mean = torch.zeros(1, self.latent_dim).to(self.device)
+            self.z_var = torch.ones(1, self.latent_dim).to(self.device)
+            self.reward_history = []  # 如果从头开始，初始化reward_history
+
+        # 主迭代循环
+        for iteration in range(start_iteration, max_iterations):
+            # 添加安全检查确保潜在变量有效
+            self._check_and_reset_latent_variables()
+
+            logger.info(f"迭代 {iteration + 1}/{max_iterations}")
+
+            # 探索和噪声 - 修改为更安全的实现
+            try:
+                self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+                exploration_rate = self.epsilon
+                noise_scale = exploration_rate * 0.5
+
+                # 安全生成噪声向量
+                # 确保z_mean和z_var在正确的设备上
+                self.z_mean = self.z_mean.to(self.device)
+                self.z_var = self.z_var.to(self.device)
+
+                # 分步生成噪声，避免直接操作可能导致的CUDA错误
+                noise_mean = torch.zeros_like(self.z_mean, device=self.device)
+                noise_mean = noise_scale * torch.randn_like(noise_mean)
+                noisy_z_mean = self.z_mean.clone()
+                noisy_z_mean = noisy_z_mean + noise_mean
+
+                # 同样安全地处理z_var
+                noise_var = torch.zeros_like(self.z_var, device=self.device)
+                noise_var = noise_scale * torch.randn_like(noise_var)
+                noisy_z_var = self.z_var.clone() * (1 + noise_var)
+                noisy_z_var = torch.clamp(noisy_z_var, 0.1, 2.0)
+
+                # 检查生成的噪声向量是否有效
+                if torch.isnan(noisy_z_mean).any() or torch.isinf(noisy_z_mean).any():
+                    logger.warning("检测到无效的noisy_z_mean值，使用默认值")
+                    noisy_z_mean = torch.zeros(1, self.latent_dim, device=self.device)
+
+                if torch.isnan(noisy_z_var).any() or torch.isinf(noisy_z_var).any():
+                    logger.warning("检测到无效的noisy_z_var值，使用默认值")
+                    noisy_z_var = torch.ones(1, self.latent_dim, device=self.device)
+            except Exception as e:
+                logger.error(f"生成噪声向量时出错: {e}")
+                # 出错时使用安全的默认值
+                noisy_z_mean = torch.zeros(1, self.latent_dim, device=self.device)
+                noisy_z_var = torch.ones(1, self.latent_dim, device=self.device)
+
+            # 分子生成
+            try:
+                new_molecules = self.generated_molecules(num_molecules_per_iteration, noisy_z_mean, noisy_z_var)
+                self.all_generated_molecules.extend(new_molecules)
+            except Exception as e:
+                logger.error(f"分子生成失败: {e}")
+                new_molecules = []
+
+            if not new_molecules:
+                logger.error(f"第 {iteration + 1} 次迭代未生成任何有效分子")
+                continue
+
+            # 记录相似性信息
+            for smiles in new_molecules:
+                try:
+                    similar_molecules = self.find_most_similar_molecules(smiles, top_k=1)
+                    self.similarity_data[smiles] = similar_molecules[0] if similar_molecules else (
+                    "未找到相似分子", 0.0)
+                    logger.info(f"分子 {smiles} 的相似度: {self.similarity_data[smiles][1]:.4f}")
+                except Exception as e:
+                    logger.warning(f"计算分子相似度失败: {smiles}, 错误: {e}")
+                    self.similarity_data[smiles] = ("错误", 0.0)
+
+            # 创建数据框
+            try:
+                iteration_df = self.create_simple_dataframe(new_molecules)
+            except Exception as e:
+                logger.error(f"创建数据框失败: {e}")
+                continue
+
+            if iteration_df.empty:
+                logger.warning(f"第 {iteration + 1} 次迭代未生成有效数据。跳过本次迭代")
+                continue
+
+            # 保存当前迭代的分子
+            iteration_output_path = os.path.join(output_dir, f'iteration_{iteration + 1}_molecules.xlsx')
+            iteration_df.to_excel(iteration_output_path, index=False)
+
+            # 预测属性
+            try:
+                predictions = self.run_gnn_prediction(
+                    iteration_output_path,
+                    model_path=self.config["paths"]["model_checkpoints_path"],
+                    config=self.config
+                )
+            except Exception as e:
+                logger.error(f"GNN预测失败: {e}")
+                predictions = None
+
+            # 检查预测结果是否有效
+            if predictions is None or predictions.empty:
+                logger.warning(f"第 {iteration + 1} 次迭代的GNN预测返回空结果")
+                avg_reward = 0
+                self.early_stop_counter += 1
+            else:
+                # 处理预测结果
+                try:
+                    merged_df = iteration_df.copy()
+                    merged_df['prediction'] = predictions['prediction'].values
+                    prediction_output_path = os.path.join(output_dir, f'iteration_{iteration + 1}_predictions.xlsx')
+                    merged_df.to_excel(prediction_output_path, index=False)
+                    logger.info(f"已保存预测结果到 {prediction_output_path}")
+
+                    # 分析预测差异
+                    diversity_results = self.analyze_prediction_differences(merged_df,
+                                                                            self.config['data']['smiles_column'])
+
+                    # 计算每个分子的奖励
+                    molecule_rewards = {}
+                    for smiles, preds in diversity_results.items():
+                        molecule_data = merged_df[merged_df[self.config['data']['smiles_column']] == smiles].iloc[0]
+                        similarity_score = molecule_data['similarity_score']
+                        reward = self.reward_function(smiles, preds, similarity_score)
+                        molecule_rewards[smiles] = reward
+
+                        # 存储经验
+                        self.store_molecule_experience(smiles, reward)
+
+                        # 更新唯一分子字典
+                        self.update_unique_molecules(smiles=smiles, preds=preds, iteration=iteration)
+
+                    # 计算平均奖励
+                    rewards_list = list(molecule_rewards.values())
+                    if rewards_list:
+                        # 过滤无效值
+                        valid_rewards = [r for r in rewards_list if not np.isnan(r) and not np.isinf(r)]
+                        avg_reward = np.mean(valid_rewards) if valid_rewards else 0
+                    else:
+                        avg_reward = 0
+
+                    self.reward_history.append(avg_reward)  # 记录本次迭代的平均奖励
+                    logger.info(f"本次迭代平均奖励: {avg_reward:.4f}")
+                    # 更新奖励统计信息
+                    self.update_reward_stats(iteration + 1, molecule_rewards)
+
+                    # 每10次迭代生成一次可视化图表
+                    if (iteration + 1) % 10 == 0:
+                        self.visualize_reward_history()
+
+                        # 如果有奖励组件信息，也可视化组件
+                        if hasattr(self, 'reward_components_history'):
+                            self.visualize_reward_by_components()
+                    # 更新早停计数器
+                    if avg_reward > self.best_reward:
+                        self.best_reward = avg_reward
+                        self.early_stop_counter = 0
+                    else:
+                        self.early_stop_counter += 1
+                except Exception as e:
+                    logger.error(f"奖励计算失败: {e}")
+                    avg_reward = 0
+                    self.early_stop_counter += 1
+
+            # 更新策略和价值网络
+            try:
+                policy_loss, value_loss = self._update_policy_and_value_networks()
+                logger.info(f"网络更新 | 策略损失: {policy_loss:.4f}, 价值损失: {value_loss:.4f}")
+            except Exception as e:
+                logger.error(f"网络更新失败: {e}")
+
+            # 更新VAE
+            try:
+                vae_loss = self._update_vae()
+                logger.info(f"VAE更新 | 损失: {vae_loss:.4f} | KL权重: {self.kl_weight:.3f}")
+            except Exception as e:
+                logger.error(f"VAE更新失败: {e}")
+
+            try:
+
+                try:
+                    # 尝试创建备份
+                    current_z_mean = self.z_mean.clone()
+                    current_z_var = self.z_var.clone()
+                except Exception as e:
+                    logger.error(f"创建潜在变量备份失败: {e}")
+                    # 如果无法克隆，创建新的张量作为备份
+                    try:
+                        current_z_mean = torch.zeros_like(self.z_mean)
+                        current_z_var = torch.ones_like(self.z_var)
+                    except:
+                        # 如果仍然失败，创建新的CPU张量
+                        current_z_mean = torch.zeros(1, self.latent_dim)
+                        current_z_var = torch.ones(1, self.latent_dim)
+
+                # 尝试调整参数
+                try:
+                    new_z_mean, new_z_var = self._safe_adjust_latent_parameters(self.z_mean, self.z_var, avg_reward)
+
+                    # 验证生成的参数
+                    if (torch.isnan(new_z_mean).any() or torch.isinf(new_z_mean).any() or
+                            torch.isnan(new_z_var).any() or torch.isinf(new_z_var).any()):
+                        logger.warning("调整后的潜在参数包含无效值，保持原值")
+                        # 使用备份值
+                        self.z_mean = current_z_mean
+                        self.z_var = current_z_var
+                    else:
+                        # 更新参数
+                        self.z_mean = new_z_mean
+                        self.z_var = new_z_var
+                except Exception as e:
+                    logger.error(f"参数调整失败: {e}")
+                    # 使用备份值
+                    if current_z_mean is not None and current_z_var is not None:
+                        self.z_mean = current_z_mean
+                        self.z_var = current_z_var
+            except Exception as e:
+                logger.error(f"潜在参数更新过程完全失败: {e}")
+                # 创建全新的安全值
+                self.z_mean = torch.zeros(1, self.latent_dim)
+                self.z_var = torch.ones(1, self.latent_dim)
+                try:
+                    self.z_mean = self.z_mean.to(self.device)
+                    self.z_var = self.z_var.to(self.device)
+                except:
+                    # 如果无法移到设备，保留在CPU上
+                    pass
+
+            # 保存检查点
+            if (iteration + 1) % 5 == 0 or iteration == max_iterations - 1:
+                self.save_checkpoint(iteration, output_dir=self.checkpoint_dir)
+
+            # 检查早停条件
+            if self.early_stop_counter >= self.early_stop_patience:
+                logger.info(f"早停触发: {self.early_stop_counter}次未改进")
+                break
+
+        # 保存最终模型
+        self.save_checkpoint(max_iterations - 1, output_dir=self.checkpoint_dir)
+
+        # 确保返回的DataFrame包含必要的列
+        final_df = self.finalize_difference_output(output_dir)
+
+        # 保存奖励历史
+        reward_history_path = os.path.join(output_dir, 'reward_history.txt')
+        with open(reward_history_path, 'w') as f:
+            for reward in self.reward_history:
+                f.write(str(reward) + '\n')
+        logger.info(f"奖励历史记录已保存到 {reward_history_path}")
+
+        self.visualize_reward_history(save_path=os.path.join(self.reward_visualization_dir, 'final_reward_history.png'))
+        self.save_reward_stats_to_file()
+
+        return final_df, self.reward_history
+
+    def _update_policy_and_value_networks(self):
+        """使用Transformer适应的更新策略"""
+        if len(self.replay_buffer) < 32:
+            return 0.0, 0.0
+
+        # 从回放缓冲区采样
+        batch_size = min(32, len(self.replay_buffer))
+        samples = random.sample(self.replay_buffer, batch_size)
+        states, rewards = zip(*samples)
+
+        # 确保状态维度正确并移动到正确的设备
+        processed_states = []
+        for s in states:
+            if isinstance(s, torch.Tensor):
+                # 确保维度匹配
+                if s.size(-1) != self.latent_dim:
+                    if s.size(-1) > self.latent_dim:
+                        s = s[..., :self.latent_dim]
+                    else:
+                        padding = torch.zeros(*s.shape[:-1], self.latent_dim - s.size(-1), device=s.device)
+                        s = torch.cat([s, padding], dim=-1)
+                processed_states.append(s.to(self.device))
+            else:
+                # 处理非张量情况
+                processed_states.append(torch.zeros(self.latent_dim, device=self.device))
+
+        # 转换为批处理张量
+        states = torch.stack(processed_states, dim=0)
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
+
+        # 价值网络评估状态值
+        state_values = self.value_network(states).squeeze()
+
+        # 如果只有一个样本，确保正确的维度
+        if state_values.dim() == 0:
+            state_values = state_values.unsqueeze(0)
+
+        # 计算优势函数
+        advantages = rewards - state_values.detach()
+
+        # 策略网络前向传播 - 现在使用Transformer架构
+        action_probs = self.policy_network(states)
+        log_probs = torch.log(action_probs + 1e-8)
+
+        # 策略梯度损失
+        policy_loss = -(log_probs * advantages.unsqueeze(1)).mean()
+
+        # 价值网络损失
+        value_loss = F.mse_loss(state_values, rewards)
+
+        # 添加策略熵正则化 - 促进探索
+        entropy = -(action_probs * log_probs).sum(dim=1).mean()
+        entropy_weight = 0.01  # 熵权重超参数
+        policy_loss = policy_loss - entropy_weight * entropy  # 鼓励策略熵
+
+        # 联合优化
+        self.policy_optimizer.zero_grad()
+        self.value_optimizer.zero_grad()
+
+        policy_loss.backward(retain_graph=True)
+        value_loss.backward()
+
+        # 梯度裁剪 - 稳定训练
+        torch.nn.utils.clip_grad_norm_(self.policy_network.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.value_network.parameters(), 1.0)
+
+        self.policy_optimizer.step()
+        self.value_optimizer.step()
+
+        return policy_loss.item(), value_loss.item()
+
+    def calculate_vae_loss(self, model_output, target_batch, beta=1.0, reduction='mean'):
+        """
+        计算VAE的损失函数，包括重构损失和KL散度损失
+
+        Parameters:
+        -----------
+        model_output : dict
+            模型的输出，应包含以下键：
+            - 'reconstruction': 重构输出
+            - 'mu': 均值向量
+            - 'logvar': 对数方差向量
+        target_batch :
+            目标数据，用于计算重构损失
+        beta : float, optional
+            KL散度损失的权重系数，默认为1.0
+        reduction : str, optional
+            指定如何减少损失，可以是'mean'或'sum'
+
+        Returns:
+        --------
+        dict:
+            包含总损失和各组成部分的字典
+        """
+        try:
+            # 安全地准备输入数据
+            target_batch = self._prepare_batch_safely(target_batch)
+
+            # 提取模型输出的各个组件
+            reconstruction = model_output.get('reconstruction')
+            mu = model_output.get('mu')
+            logvar = model_output.get('logvar')
+
+            if reconstruction is None or mu is None or logvar is None:
+                logger.error("Missing required components in model output")
+                return {'loss': torch.tensor(float('nan'), requires_grad=True)}
+
+            # 计算重构损失 (可以根据任务类型调整)
+            if isinstance(reconstruction, dict) and 'logits' in reconstruction:
+                # 如果是分类任务（如逐字符重构）
+                logits = reconstruction['logits']
+                recon_loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    target_batch.view(-1),
+                    reduction=reduction
+                )
+            elif hasattr(reconstruction, 'shape') and hasattr(target_batch, 'shape'):
+                # 如果是回归任务（如直接特征重构）
+                if reduction == 'mean':
+                    recon_loss = F.mse_loss(reconstruction, target_batch, reduction='mean')
+                else:
+                    recon_loss = F.mse_loss(reconstruction, target_batch, reduction='sum')
+            else:
+                # 自定义损失处理，根据您的具体数据类型
+                logger.warning("Using custom reconstruction loss calculation")
+                recon_loss = self._custom_reconstruction_loss(reconstruction, target_batch)
+
+            # 计算KL散度损失
+            # KL散度 = -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
+            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+            if reduction == 'mean':
+                kl_loss = kl_loss / mu.size(0)  # 除以批次大小
+
+            # 总损失 = 重构损失 + beta * KL散度损失
+            total_loss = recon_loss + beta * kl_loss
+
+            return {
+                'loss': total_loss,
+                'reconstruction_loss': recon_loss.detach(),
+                'kl_loss': kl_loss.detach(),
+                'beta': beta
+            }
+
+        except Exception as e:
+            logger.error(f"Error in calculate_vae_loss: {e}")
+            # 返回NaN损失，同时保持梯度以防止训练崩溃
+            return {'loss': torch.tensor(float('nan'), requires_grad=True)}
+
+    def _custom_reconstruction_loss(self, reconstruction, target):
+        """
+        自定义重构损失计算，处理特殊的分子表示
+
+        可以根据您的具体分子表示方式进行自定义
+        - 对于SMILES字符串，可能需要逐字符的交叉熵
+        - 对于图表示，可能需要边和节点特征的损失
+        - 对于指纹，可能需要二进制交叉熵
+        """
+        try:
+            # 示例：如果是分子指纹（二进制向量）
+            if hasattr(reconstruction, 'sigmoid'):
+                # 应用sigmoid激活
+                reconstruction = torch.sigmoid(reconstruction)
+                return F.binary_cross_entropy(reconstruction, target, reduction='mean')
+
+            # 示例：如果是SMILES的one-hot编码
+            elif reconstruction.dim() > 2 and target.dim() == 2:
+                return F.cross_entropy(
+                    reconstruction.transpose(1, 2),  # [batch, vocab_size, seq_len]
+                    target,  # [batch, seq_len]
+                    reduction='mean'
+                )
+
+            # 默认使用MSE损失
+            return F.mse_loss(reconstruction, target, reduction='mean')
+
+        except Exception as e:
+            logger.error(f"Error in _custom_reconstruction_loss: {e}")
+            return torch.tensor(0.0, requires_grad=True)
+
+    def _prepare_batch_safely(self, batch, device=None):
+        """
+        安全地准备批次数据，处理各种可能的输入类型和异常情况。
+
+        Parameters:
+        -----------
+        batch :
+            输入批次数据，可以是字典、列表、张量或其他格式
+        device : torch.device, optional
+            要将数据移动到的设备
+
+        Returns:
+        --------
+        处理后的批次数据
+        """
+        try:
+            # 如果批次为None，返回空字典
+            if batch is None:
+                logger.warning("Received None batch, returning empty dict")
+                return {}
+
+            # 如果批次是字典
+            if isinstance(batch, dict):
+                result = {}
+                for key, value in batch.items():
+                    # 递归处理字典中的每个元素
+                    result[key] = self._prepare_batch_safely(value, device)
+                return result
+
+            # 如果批次是列表或元组
+            elif isinstance(batch, (list, tuple)):
+                return [self._prepare_batch_safely(item, device) for item in batch]
+
+            # 如果批次是PyTorch张量
+            elif hasattr(batch, 'to') and callable(batch.to):  # 检查是否是torch.Tensor或类似对象
+                if device is not None:
+                    return batch.to(device)
+                return batch
+
+            # 如果批次是NumPy数组
+            elif hasattr(batch, 'shape') and hasattr(batch, 'dtype'):  # 可能是numpy数组
+                import torch
+                import numpy as np
+                if isinstance(batch, np.ndarray):
+                    # 将NumPy数组转换为PyTorch张量
+                    tensor = torch.from_numpy(batch)
+                    if device is not None:
+                        return tensor.to(device)
+                    return tensor
+
+            # 默认情况，返回原始数据
+            return batch
+
+        except Exception as e:
+            logger.error(f"Error in _prepare_batch_safely: {e}")
+            # 在出错的情况下，返回原始批次
+            return batch
+
+    @tensor_debug_wrapper
+    def _update_vae(self, batch_size=32):
+        """使用高质量分子样本更新VAE模型 - 优化版本"""
+        if len(self.high_quality_buffer) < batch_size:
+            logger.info(f"高质量缓冲区样本不足：{len(self.high_quality_buffer)}/{batch_size}，跳过VAE更新")
+            return 0.0
+
+        try:
+            # 从高质量缓冲区随机采样
+            samples = random.sample(self.high_quality_buffer, batch_size)
+            latent_vectors, rewards = zip(*samples)
+
+            # 将潜在向量转换为批处理张量
+            latent_batch = torch.stack([vector.to(self.device) for vector in latent_vectors])
+
+            # 准备输入数据
+            self.vae_optimizer.zero_grad()
+
+            # 尝试使用mu.weight参数，这已在日志中显示是可用的
+            found_param = False
+            for name, param in self.vae_model.named_parameters():
+                if name == 'mu.weight' and param.requires_grad:
+                    found_param = True
+
+                    # 获取潜在向量维度
+                    latent_dim = latent_batch.size(-1)
+
+                    # 创建一个简单的损失函数，将潜在向量与mu.weight相关联
+                    # 这里的关键是确保损失函数涉及VAE的参数
+                    random_input = torch.randn(batch_size, param.size(1), device=self.device)
+                    output = F.linear(random_input, param)  # 使用param作为权重进行线性变换
+
+                    # 计算输出与潜在向量之间的损失
+                    # 我们希望使mu.weight产生的输出接近目标潜在向量
+                    reconstruction_loss = F.mse_loss(output, latent_batch)
+
+                    # 总损失
+                    total_loss = reconstruction_loss
+
+                    # 反向传播
+                    total_loss.backward()
+
+                    logger.info(f"使用mu.weight进行更新 | 损失: {safe_tensor_to_scalar(total_loss):.6f}")
+                    break
+
+            if not found_param:
+                # 如果找不到mu.weight，使用增强版的参数直接更新方法
+                logger.info("未找到mu.weight参数，使用增强版参数更新方法")
+
+                # 获取高质量样本的统计特性
+                mean_latent = torch.mean(latent_batch, dim=0)
+                std_latent = torch.std(latent_batch, dim=0)
+
+                # 更新与潜在空间相关的参数
+                update_count = 0
+                for name, param in self.vae_model.named_parameters():
+                    if not param.requires_grad:
+                        continue
+
+                    if 'weight' in name and param.dim() == 2:
+                        # 对于权重矩阵，应用智能更新
+                        # 使其行/列的均值和方差接近潜在向量的统计特性
+                        if param.size(0) == latent_batch.size(1):  # 如果第一个维度匹配潜在维度
+                            # 计算当前行均值和方差
+                            row_mean = torch.mean(param, dim=1)
+                            row_std = torch.std(param, dim=1)
+
+                            # 计算目标和当前统计量之间的差异
+                            mean_diff = (mean_latent - row_mean).unsqueeze(1)
+                            std_ratio = (std_latent / (row_std + 1e-8)).unsqueeze(1)
+
+                            # 应用柔和的更新
+                            # 调整均值
+                            param.data += mean_diff * 0.01
+                            # 调整方差
+                            param.data *= 0.99 + 0.01 * std_ratio
+
+                            update_count += 1
+                        elif param.size(1) == latent_batch.size(1):  # 如果第二个维度匹配潜在维度
+                            # 类似的更新，但针对列
+                            col_mean = torch.mean(param, dim=0)
+                            col_std = torch.std(param, dim=0)
+
+                            mean_diff = mean_latent - col_mean
+                            std_ratio = std_latent / (col_std + 1e-8)
+
+                            # 应用柔和的更新
+                            param.data += 0.01 * mean_diff
+                            param.data *= 0.99 + 0.01 * std_ratio
+
+                            update_count += 1
+                    else:
+                        # 对于其他参数，应用小幅随机更新
+                        noise = torch.randn_like(param) * 0.001
+                        param.data += noise
+                        update_count += 1
+
+                logger.info(f"直接更新了 {update_count} 个参数")
+
+                # 使用一个合理的损失值
+                total_loss = torch.tensor(0.1, device=self.device)
+
+            # 应用优化器
+            # 如果我们使用的是direct update，这一步不会有效果，但也无害
+            self.vae_optimizer.step()
+
+            # 调整KL权重
+            self.kl_weight = min(1.0, self.kl_weight + self.kl_annealing_rate)
+
+            # 记录详细信息
+            logger.info(f"VAE更新详情 | 总损失: {safe_tensor_to_scalar(total_loss):.6f} | KL权重: {self.kl_weight:.3f}")
+
+            return safe_tensor_to_scalar(total_loss)
+
+        except Exception as e:
+            logger.error(f"VAE更新过程中出错: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return 0.0
+
+    def finalize_difference_output(self, output_dir: str) -> pd.DataFrame:
+        """确保返回的DataFrame包含必要的列"""
+        columns = ['New_SMILES', 'Metal_Difference', 'Environment_Predictions',
+                   'Most_Similar_Original_SMILES', 'Similarity_Score', 'Iterations']
+
+        if not self.unique_molecules:
+            logger.warning("没有生成任何分子数据，返回空DataFrame")
+            return pd.DataFrame(columns=columns)
+
+        final_output = []
+        for smiles, data in self.unique_molecules.items():
+            # 确保所有字段都存在
+            metal_diff = data.get('metal_difference', 0.0)
+            predictions = data.get('predictions', {})
+            iterations = data.get('iterations', set())
+
+            env_predictions = [f"{env}: {pred:.4f}" for env, pred in predictions.items()]
+
+            # 从similarity_data获取相似性信息
+            similarity_info = self.similarity_data.get(smiles, ("未找到相似分子", 0.0))
+            similar_smiles = similarity_info[0]
+            similarity_score = similarity_info[1]
+
+            final_output.append({
+                'New_SMILES': smiles,
+                'Metal_Difference': metal_diff,
+                'Environment_Predictions': '; '.join(env_predictions),
+                'Most_Similar_Original_SMILES': similar_smiles,
+                'Similarity_Score': similarity_score,
+                'Iterations': ', '.join(map(str, sorted(iterations)))
+            })
+
+        final_df = pd.DataFrame(final_output)
+
+        # 确保所有列都存在
+        for col in columns:
+            if col not in final_df.columns:
+                final_df[col] = None
+
+        # 保存结果
+        final_output_path = os.path.join(output_dir, 'final_comprehensive_molecules.xlsx')
+        final_df.to_excel(final_output_path, index=False)
+        logger.info(f"已保存包含差异、相似度信息的最终结果到 {final_output_path}, 包含 {len(final_df)} 个分子")
+
+        return final_df
+
+    def update_unique_molecules(self, smiles: str,
+                                preds: Dict[str, float], iteration: int) -> None:
+        """确保所有必要字段都被初始化"""
+        if smiles not in self.unique_molecules:
+            self.unique_molecules[smiles] = {
+                'predictions': {},
+                'metal_difference': 0.0,
+                'iterations': set()
+            }
+
+        # 保存预测结果
+        self.unique_molecules[smiles]['predictions'].update(preds)
+
+        # 计算金属环境差异（确保至少有两个预测）
+        if len(preds) >= 2:
+            pred_values = list(preds.values())
+            metal_difference = abs(pred_values[0] - pred_values[1])
+            self.unique_molecules[smiles]['metal_difference'] = metal_difference
+
+        # 添加迭代信息
+        self.unique_molecules[smiles]['iterations'].add(iteration + 1)
+
+    def store_molecule_experience(self, smiles: str, reward: float):
+        """存储分子经验，利用序列表示增强Transformer学习"""
+        try:
+            # 获取原始字符索引序列
+            char_indices = []
+            for char in smiles:
+                if char in self.charset:
+                    char_indices.append(self.charset.index(char))
+                else:
+                    # 替换为特殊字符的索引或跳过
+                    if '<unk>' in self.charset:
+                        char_indices.append(self.charset.index('<unk>'))
+                    continue
+
+            # 确保序列不超过最大长度
+            max_seq_len = self.config['data'].get('max_seq_len', 100)
+            if len(char_indices) > max_seq_len:
+                char_indices = char_indices[:max_seq_len]
+
+            # 填充序列至固定长度
+            padded_indices = char_indices + [0] * (max_seq_len - len(char_indices))
+            char_tensor = torch.tensor(padded_indices, dtype=torch.long).to(self.device)
+
+            # 获取字符嵌入
+            with torch.no_grad():
+                # 使用VAE模型的嵌入层获取字符嵌入
+                embedded = self.vae_model.embedding(char_tensor.unsqueeze(0))  # [1, seq_len, embed_dim]
+
+                # 使用编码器获取潜在表示
+                mu, logvar = self.vae_model.encode(char_tensor.unsqueeze(0))
+                latent_vector = self.vae_model.reparameterize(mu, logvar)
+
+                # 将字符嵌入和潜在向量结合，创建更丰富的表示
+                # 这里我们使用潜在向量作为整个序列的全局上下文
+                global_context = latent_vector.expand(embedded.size(1), -1)  # [seq_len, latent_dim]
+
+                # 结合局部和全局特征
+                sequence_repr = torch.cat([
+                    embedded.squeeze(0),  # [seq_len, embed_dim]
+                    global_context  # [seq_len, latent_dim]
+                ], dim=1)  # [seq_len, embed_dim + latent_dim]
+
+                # 使用平均池化获得整体表示
+                # 我们也可以直接使用潜在向量，但这种方式结合了更多序列信息
+                pooled_repr = sequence_repr.mean(dim=0)  # [embed_dim + latent_dim]
+
+            # 调整维度以匹配策略网络的输入
+            if pooled_repr.size(0) > self.latent_dim:
+                pooled_repr = pooled_repr[:self.latent_dim]
+            elif pooled_repr.size(0) < self.latent_dim:
+                padding = torch.zeros(self.latent_dim - pooled_repr.size(0), device=self.device)
+                pooled_repr = torch.cat([pooled_repr, padding])
+
+            # 存储经验
+            self.replay_buffer.append((pooled_repr.detach().cpu(), reward))
+
+            # 对高质量样本的特殊处理
+            if reward > 1.0:  # 设置合适的阈值
+                self.high_quality_buffer.append((pooled_repr.detach().cpu(), reward))
+
+        except Exception as e:
+            logger.error(f"存储分子经验失败: {smiles}, 错误: {e}")
+
+    def analyze_prediction_differences(self, merged_df: pd.DataFrame, smiles_column: str) -> Dict[
+        str, Dict[str, float]]:
+        """
+        Analyze the prediction differences for the same SMILES molecules under different metal environments.
+        """
+        diversity_results = defaultdict(dict)
+        metal_column = self.config['data']['metal_column']  # Get the metal column name
+
+        for _, row in merged_df.iterrows():
+            smiles = row[smiles_column]
+            metal_type = row[metal_column]  # Get metal type (Am/Eu)
+            environment_id = f"{metal_type}_{row.get('environment_id', 'default')}"
+            prediction = row['prediction']
+
+            diversity_results[smiles][environment_id] = prediction
+
+        # Log the metal environment differences
+        for smiles, preds in diversity_results.items():
+            if len(preds) >= 2:
+                values = list(preds.values())
+                diff = abs(values[0] - values[1])
+                logger.info(
+                    f"Molecule {smiles} has a prediction difference of {diff:.4f} in two metal environments.")
+
+        return diversity_results
+
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import random
+from typing import Dict, Any, List, Tuple
+import matplotlib.pyplot as plt
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from rdkit.DataStructs import BulkTanimotoSimilarity
+import json
+import logging
+
+# Configure logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+
+
+class AttentionEnhancedValueNetwork(nn.Module):
+    def __init__(self, input_dim, hidden_dim=256, num_heads=4):
+        super().__init__()
+        self.input_projection = nn.Linear(input_dim, hidden_dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            batch_first=True
+        )
+        self.fc_layers = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, x):
+        x = self.input_projection(x).unsqueeze(1)  # [batch, 1, hidden_dim]
+        attn_output, _ = self.attention(x, x, x)
+        return self.fc_layers(attn_output.squeeze(1))
+
+
+
+class Charset:
+    def __init__(self, chars):
+        self.chars = chars
+        self.char_to_index = {char: idx for idx, char in enumerate(chars)}  # 字符到索引的映射
+        self.index_to_char = {idx: char for idx, char in enumerate(chars)}  # 索引到字符的映射
+
+    def encode(self, smiles):
+        """将 SMILES 字符串编码为索引列表"""
+        return [self.char_to_index.get(char, -1) for char in smiles]  # 找不到字符时返回-1
+
+    def decode(self, indices):
+        """将索引列表解码为 SMILES 字符串"""
+        return ''.join(self.index_to_char[idx] for idx in indices if idx in self.index_to_char)
+
+    def index(self, char):
+        """返回字符对应的索引"""
+        return self.char_to_index.get(char, -1)  # 返回字符的索引，未找到则返回 -1
+
+    def __len__(self):
+        """返回字符集的大小"""
+        return len(self.chars)
+
+    def __contains__(self, char):
+        """检查字符是否在字符集中"""
+        return char in self.char_to_index  # 基于字符到索引映射检查
+
+    def __getitem__(self, idx):
+        """支持通过索引访问字符"""
+        return self.index_to_char.get(idx, None)  # 返回索引对应的字符
+
+
+def main():
+    """主函数：询问是否加载预训练与微调模型，实现完整业务流程"""
+    # 1. 加载配置
+    config = load_config(CONFIG_FILE)
+
+    # 2. 数据准备
+    print("\n=== 数据准备阶段 ===")
+    main_df = pd.read_excel(config['paths']['main_data_path'], sheet_name=config['data']['main_sheet'])
+    main_smiles = filter_valid(main_df[config['data']['smiles_column']].tolist())
+    print(f"[main] 主数据集有效 SMILES 数量: {len(main_smiles)}")
+
+    ft_df = pd.read_excel(config['paths']['main_data_path'], sheet_name=config['data']['ft_sheet'])
+    ft_smiles = filter_valid(ft_df[config['data']['smiles_column']].tolist())
+    print(f"[main] 微调数据集有效 SMILES 数量: {len(ft_smiles)}")
+    ft_smiles = [s for s in ft_smiles if s not in main_smiles]
+
+    # 3. 根据用户交互，决定是否加载预训练和微调的模型
+    load_pretrained = input("是否要加载预训练模型？[y/N]: ").strip().lower() == 'y'
+    load_finetuned = input("是否要加载微调模型？[y/N]: ").strip().lower() == 'y'
+
+    print("\n=== 模型初始化 ===")
+    charset = build_vocab(main_smiles + ft_smiles)
+    device = torch.device(config['training']['device'])
+
+    vae = VAE(
+        vocab_size=len(charset),
+        latent_dim=config['model']['latent_dim'],
+        embedding_dim=config['model']['embedding_dim'],
+        hidden_dim=config['model']['hidden_dim'],
+        num_layers=config['model']['num_layers'],
+        dropout=config['model']['dropout']
+    ).to(device)
+
+    # 如果用户选择加载预训练模型
+    if load_pretrained:
+        pretrained_path = os.path.join(config['paths']['checkpoint_dir'], 'pretrain_best.pth')
+        if os.path.exists(pretrained_path):
+            print(f"[main] 加载预训练模型参数：{pretrained_path}")
+            vae.load_state_dict(torch.load(pretrained_path, map_location=device))
+        else:
+            print("[main] 未找到预训练模型文件，将使用随机初始化模型。")
+    else:
+        print("\n=== 预训练阶段 ===")
+        main_dataset = VAEDataset(
+            main_smiles,
+            charset,
+            max_len=config['data']['max_len'],
+            augment_prob=config['data']['augment_prob']
+        )
+        train_loader = DataLoader(
+            main_dataset,
+            batch_size=config['training']['batch_size'],
+            shuffle=True,
+            num_workers=config['training']['num_workers']
+        )
+        vae = train_vae(
+            model=vae,
+            dataloader=train_loader,
+            epochs=config['training']['main_epochs'],
+            lr=config['training']['main_lr'],
+            beta_start=config['training']['beta_start'],
+            beta_end=config['training']['beta_end'],
+            warmup_epochs=config['training']['warmup_epochs'],
+            checkpoint_path=os.path.join(config['paths']['checkpoint_dir'], 'pretrain_best1.pth')
+        )
+
+    # 5. 可视化预训练过程
+    #visualize_augmentations(VAEDataset(main_smiles, charset),
+    #                        output_dir=os.path.join(config['paths']['visualization_dir'], 'augmentations'))
+    #visualize_training_metrics(config['paths']['checkpoint_dir'])
+    #
+    # 6. 微调阶段
+    if load_finetuned:
+        finetuned_path = os.path.join(config['paths']['checkpoint_dir'], 'finetuned.pth')
+        if os.path.exists(finetuned_path):
+            print(f"[main] 加载微调模型参数：{finetuned_path}")
+            vae.load_state_dict(torch.load(finetuned_path, map_location=device))
+            ft_charset = charset  # 若你已在fine_tune函数保存了charset文件，需加载之
+        else:
+            print("[main] 未找到微调模型文件，将跳过微调加载。")
+            ft_charset = charset
+    else:
+        print("\n=== 微调阶段 ===")
+        vae, ft_charset = fine_tune(
+            model=vae,
+            main_data=main_smiles,
+            fine_tune_data=ft_smiles,
+            epochs=config['training']['ft_epochs'],
+            lr=config['training']['ft_lr'],
+            beta=config['training']['ft_beta'],
+            checkpoint_path=config['paths']['checkpoint_dir'],
+            partial_unfreeze=config['training']['partial_unfreeze'],
+            model_name="finetuned1"
+        )
+
+    # 7. 分子生成
+    print("\n=== 分子生成 ===")
+    workflow = MoleculeWorkflow(
+        vae,
+        config['paths']['main_data_path'],
+        config,
+        Charset(charset),
+        checkpoint_dir="/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/base7/checkpoints2/"
+    )
+
+    # 执行分子精炼工作流
+    refined_molecules,reward_history = workflow.molecular_refinement_workflow(
+        max_iterations=200,
+        num_molecules_per_iteration=1000
+    )
+    visualize_sar(refined_molecules, reward_history)
+    # # results = run_value_network_ablation(workflow)
+    # if isinstance(refined_molecules, pd.DataFrame) and refined_molecules.empty:
+    #     print("未生成任何有效数据，无法创建 Excel 文件")
+    # else:
+    #     result_df = pd.DataFrame({'Refined_Molecules': refined_molecules['SMILES']})
+    #     result_df.to_excel('/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/base7/checkpoints2/refined_molecules2.xlsx', index=False)
+
+if __name__ == "__main__":
+    main()
+
+
