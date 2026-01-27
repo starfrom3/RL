@@ -1,0 +1,458 @@
+import pandas as pd
+from ccdc.io import MoleculeReader, EntryReader
+from ccdc import molecule
+import os
+from ccdc import io
+import itertools
+from ccdc.solid_form import SolvateAnalyser
+from rdkit import Chem
+
+
+# 筛出溶剂
+def extract_smiles_from_mol2(folder_path):
+    smiles_dict = {}
+    files = [f for f in os.listdir(folder_path) if f.endswith('.mol2')]
+
+    for file_name in files:
+        file_path = os.path.join(folder_path, file_name)
+        mol_reader = MoleculeReader(file_path)
+
+        for mol in mol_reader:
+            smiles = mol.smiles
+            smiles_dict[file_name] = smiles
+
+    return smiles_dict
+
+
+folder_path = '/home/pub/ccdc/ccdc-software/mercury/molecular_libraries/ccdc_solvents'
+smiles_dict = extract_smiles_from_mol2(folder_path)
+
+solvents = set()
+solvents.add("F[B-](F)(F)F")
+solvents.add("Br")
+solvents.add("I")
+solvents.add("Cl")
+solvents.add("C")
+solvents.add("N")
+solvents.add("OC(=O)C(O)=O")
+for i in smiles_dict.values():
+    solvents.add(i)
+# 判断溶剂
+def is_solvent(component):
+    if type(component) == str:
+        if component in solvents:
+            return True
+    elif component.smiles in solvents:
+        return True
+    else:
+        return False
+
+# 判断是否含有金属
+def has_metal(component):
+    for atom in component.atoms:
+        if atom.is_metal:
+            return True
+
+
+# 按照质量分子大小进行排序
+def sort_components_by_mass(mol):
+    # 函数1
+    """
+    目的：对一个晶体中各个组分进行排序，按照组分质量从小到大排序，不过包含金属的组分，默认添加到最后位置
+    :param components:
+    :param metal_atoms:
+    :return:
+    """
+    all_solvents_list = {}
+    component_dict = {}
+    metal_component = []
+    # unique_mol=set()
+    for component in mol.components:
+        # if component.smiles not in unique_mol:
+        #     unique_mol.update(component)
+        # else:
+        #     continue
+        if is_solvent(component):
+            if component.smiles not in all_solvents_list.keys():
+                all_solvents_list[component.smiles]=1
+            else:
+                all_solvents_list[component.smiles]+=1
+            continue
+        for atom in component.atoms:
+            if atom.is_metal:
+                metal_component.append(component)
+                continue
+        component_dict[component] = component.molecular_weight
+
+    sorted_components = sorted(component_dict.items(), key=lambda x: x[1])
+    sorted_component_names = [component[0] for component in sorted_components]
+
+    sorted_component_names.extend(metal_component)
+
+    return list(set(sorted_component_names)),all_solvents_list
+
+
+# 判断金属链接键
+def have_metal_metal(component):
+    has_metal_metal_bond = False
+    for bond in component.bonds:
+        atom1_index, atom2_index = bond.atoms
+        atom1_index = component.atoms.index(atom1_index)
+        atom1 = component.atoms[atom1_index]
+        atom2_index = component.atoms.index(atom2_index)
+        atom2 = component.atoms[atom2_index]
+
+        if atom1.is_metal and atom2.is_metal:
+            has_metal_metal_bond = True
+            break
+    return has_metal_metal_bond
+
+
+def remove_metal_from_component( component1):
+    metal_set2 = set()
+    yang_dict = {}
+    global yang
+    yang = "无"
+    O_number = 0
+    O2_number = 0
+    multi_metal = False
+    t = []
+    metal_name=None
+    metal_num={}
+    labels=[]
+    component=component1
+    for atom in component.atoms:
+        atom.formal_charge = 0
+        global error
+        # if "Cu" in str(atom):
+        if atom.is_metal:
+            metal_name = str(atom.atomic_symbol)
+            if metal_name not in metal_num.keys():
+                metal_num[metal_name]=1
+            else:
+                metal_num[metal_name]+=1
+            for neighbor_atom in atom.neighbours:
+                if neighbor_atom.atomic_symbol == 'O':
+                    if len(neighbor_atom.neighbours) == 1:
+                        O_number += 1
+                        t.append(neighbor_atom)
+                    elif len(neighbor_atom.neighbours) >= 2 and all(a.is_metal for a in neighbor_atom.neighbours):
+                        O2_number += 1
+                        t.append(neighbor_atom)
+                        # print(f"{identifier}特殊氧化物")
+                    else:
+                        continue
+
+            if O_number != 0 or O2_number != 0:
+                yang = "有"
+            #移除的是氧原子
+            yang_dict[str(atom)] = O_number
+            component.remove_bonds(atom.bonds)
+            component.remove_unknown_atoms()
+            # try:
+            #     for i in t:
+            #         component.remove_atom(i)
+            # except RuntimeError as e:
+            #     # print("An error occurred while removing metal from component:", e)
+            #     global error
+            #     error.append(e)
+            metal_set2.add(str(atom.atomic_symbol))
+            component.remove_atom(atom)
+
+            # for i in component.components:
+            #     print(i.smiles)
+            #     if is_solvent(i):
+            #         component.remove_atom(i)
+            # print(component.smiles)
+    # print(O_number)
+    # print(O2_number)
+    # if len(metal_set2) == 1:
+    #     multi_metal = True
+    return component, yang_dict, metal_set2,metal_name,metal_num
+import pandas as pd
+
+def count_and_output(components, output_folder, identifier, metal_name, metal_num):
+    unique_smiles = {}
+    mol_content = {}
+    mol_solvents_list = {}
+
+    # 初始化空的DataFrame来存储数据
+    data = pd.DataFrame(columns=['Identifier', 'SMILES', 'Count', 'Metal', 'Metal_num'])
+
+    # 遍历组件，统计SMILES和溶剂信息
+    for i in components.components:
+        try:
+            # i.assign_bond_types()
+            i.add_hydrogens()
+        except RuntimeError as e:
+            if "AllBondTypesAssigner<MoleculeType>::probable_bond_types():molecule contains non-H atoms with no site information" in str(e):
+                continue
+        print(i.smiles)
+        if i is None:
+            i.assign_bond_types()
+        print(i.smiles)
+        # 检查是否为溶剂
+        if is_solvent(i):
+            if i.smiles not in mol_solvents_list:
+                mol_solvents_list[i.smiles] = 1
+            else:
+                mol_solvents_list[i.smiles] += 1
+            continue
+
+        # 更新化合物的SMILES和内容
+        if i.smiles not in unique_smiles:
+            unique_smiles[i.smiles] = 1
+            mol_content[i.smiles] = i
+        else:
+            unique_smiles[i.smiles] += 1
+
+
+    # 生成DataFrame行数据
+    for smiles, count in unique_smiles.items():
+        if is_solvent(mol_content[smiles]):
+            continue
+
+        row_data = {
+            'Identifier': identifier,
+            'SMILES': smiles,
+            'Count': count,
+            'Metal': metal_name,
+            'Metal_num': metal_num.get(metal_name, 0)
+        }
+
+        # 添加溶剂信息
+        for idx, (solvent_smiles, solvent_count) in enumerate(mol_solvents_list.items(), start=1):
+            row_data[f'Solvent{idx}_SMILES'] = solvent_smiles
+            row_data[f'Solvent{idx}_Count'] = solvent_count
+
+        # 将行数据添加到DataFrame中
+        data = data.append(row_data, ignore_index=True)
+
+    return data
+
+## 解决计数以及输出问题
+# def count_and_output(components, output_folder, identifier, metal_name, metal_num):
+#     unique_smiles = {}
+#     mol_content = {}
+#     mol_solvents_list = {}
+#     id_all = {}
+#
+#     # 创建一个空的DataFrame来存储数据
+#     data = pd.DataFrame(columns=['Identifier', 'SMILES', 'Count', 'Metal', 'Metal_num'])
+#
+#     for i in components.components:
+#         try:
+#             i.assign_bond_types()
+#             i.add_hydrogens()
+#         except RuntimeError as e:
+#             if "AllBondTypesAssigner<MoleculeType>::probable_bond_types():molecule contains non-H atoms with no site information" in str(
+#                     e):
+#                 continue
+#         if is_solvent(i):
+#             if i.smiles not in mol_solvents_list:
+#                 mol_solvents_list[i.smiles] = 1
+#             else:
+#                 mol_solvents_list[i.smiles] += 1
+#             continue
+#         if i.smiles not in unique_smiles:
+#             unique_smiles[i.smiles] = 1
+#             mol_content[i.smiles] = i
+#         else:
+#             unique_smiles[i.smiles] += 1
+#
+#     for smiles, content in mol_content.items():
+#         if "None" not in id_all.get(smiles, ""):
+#             if is_solvent(content):
+#                 continue
+#             else:
+#                 row_data = {
+#                     'Identifier': identifier,
+#                     'SMILES': smiles,
+#                     'Count': unique_smiles[smiles],
+#                     'Metal': metal_name,
+#                     'Metal_num': metal_num[metal_name]
+#                 }
+#
+#                 for idx, (solvent_smiles, count) in enumerate(mol_solvents_list.items(), start=1):
+#                     row_data[f'Solvent{idx}_SMILES'] = solvent_smiles
+#                     row_data[f'Solvent{idx}_Count'] = count
+#
+#                 data = data.append(row_data, ignore_index=True)
+#         else:
+#             break
+#
+#     return data
+# def count_and_output(components, output_folder, identifier,metal_name,metal_num):
+#     unique_smiles = {}
+#     mol_content = {}
+#     mol_solvents_list = {}
+#     id_all={}
+#     # 创建一个空的DataFrame来存储数据
+#     data = pd.DataFrame(columns=['Identifier', 'SMILES', 'Count',"Metal","Metal_num"])
+#
+#     for i in components.components:
+#         try:
+#             i.assign_bond_types()
+#             i.add_hydrogens()
+#         except RuntimeError as e:
+#             if "AllBondTypesAssigner<MoleculeType>::probable_bond_types():molecule contains non-H atoms with no site information" in str(
+#                     e):
+#                 # print(f"{identifier}:Encountered a molecule with non-H atoms lacking site information.")
+#                 continue
+#         if is_solvent(i):
+#             continue
+#         if i not in id_all.values():
+#             id_all[i.smiles]=i.to_string("mol")
+#         if i.smiles not in unique_smiles:
+#             unique_smiles[i.smiles] = 1
+#             mol_content[i.smiles] = i
+#         else:
+#             unique_smiles[i.smiles] += 1
+#         # mol_content[i.smiles] = i
+#     # print(unique_smiles)
+#     # print(mol_content)
+#     for smiles, content in mol_content.items():
+#
+#         # print(smiles)
+#         if "None" not in id_all[smiles]:
+#             content = mol_content[smiles]
+#             if is_solvent(content):
+#                 continue
+#                 # for atom in content.atoms:
+#                 # global id_all
+#                 # id_all = id_all.remove_group(content)
+#             else:
+#                 # 添加数据到DataFrame中
+#                 data = data.append({'Identifier': identifier,
+#                                     'SMILES': smiles,
+#                                     'Count': unique_smiles[smiles],
+#                                    "Metal":metal_name,"Metal_num":metal_num[metal_name]
+#                                     },ignore_index=True)
+#                 # 输出到mol2文件
+#                 # if "Cu" in metal_name.atomic_symbol:
+#                 # output_file = f"{identifier}_{metal_name}__{content.formula}.mol2"
+#                 # output_path = os.path.join(output_folder, output_file)
+#                 # with open(output_path, 'w') as f:
+#                 #     f.write(id_all[smiles])
+#         else:
+#             break
+#             # mol2=hp.Molecule.read_from(output_path,"mol2")
+#             # mol2.retrieve_metal_ligand_pairs()
+#             # mol2.remove_solvents()
+#             # # t=mol2.remove_solvents()
+#             # # mol2.writefile(f"/home/qyl/CSD_data/try_molll/{identifier}_{metal_name.atomic_symbol}_{yang}.mol2")
+#             # mol2.writefile("mol2",path_file="/home/qyl/CSD_data/try_molll/1.mol2")
+#
+#     return data
+#     # 将数据写入Excel文件
+#     # excel_output_path = os.path.join(output_folder, f"Cu_data.xlsx")
+#     # data.to_excel(excel_output_path, index=False)
+
+def read_excel_column(file_path, column_name):
+    df = pd.read_excel(file_path, usecols=[column_name])
+    column_data = df[column_name].tolist()
+    return column_data
+
+# 示例用法
+file_path = "/home/qyl/CSD_data/1_CSD/output_deduped.xlsx"
+column_name = "Identifier"
+top_molecule_ids = read_excel_column(file_path, column_name)
+
+csd_reader = EntryReader('CSD')
+# top_molecule_ids = [entry.identifier for entry in itertools.islice(csd_reader, 100)]
+# top_molecule_ids=[entry.identifier for entry in csd_reader]
+# top_molecule_ids = ["ABABOY"]
+# top_molecule_ids=["KUVSUQ"]#带有溶剂的配合物(溶剂参与配位）
+# top_molecule_ids=["KUVVON"]#溶剂不参与配位的配合物
+# top_molecule_ids=["ABACOY"]
+# top_molecule_ids=["AACRHA"]
+# top_molecule_ids=["ABADEQ"]
+# top_molecule_ids=["AAMTCO"]
+# top_molecule_ids=["ABADEP"]
+# top_molecule_ids=["ZZZWQW01"]#氧化物
+# top_molecule_ids = ["ABAMEW"]
+# top_molecule_ids = ["AABHTZ"]#无金属
+time = 1
+all_number = {}
+output_folder = "/home/qyl/CSD_data/csd_excel"
+error=[]
+formula_unique=[]
+
+all_excel_data = pd.DataFrame()
+for identifier in top_molecule_ids[:10]:
+    number_O_dict = {}
+    number_O_name = []
+    mol = csd_reader.molecule(identifier)
+    # for component in mol.components:
+    #     remove_metal_from_component(component,metal_atoms,output_folder,identifier)
+    # analyser = SolvateAnalyser(crystal)
+    # solvents.update(str(solvent.name) for solvent in analyser.find_solvents())
+    # len_component = len(mol.components)
+
+    if mol.is_polymeric:
+        continue
+    # elif mol.is_organic:
+    # mol.remove_solvents()
+    t=sort_components_by_mass(mol)
+    components_sorted = set(t[0])
+    all_sol=t[1]
+    for i in components_sorted:
+        if len(i.atoms)==1:
+            continue
+        if str(i.formula) not in formula_unique:
+            formula_unique.append(str(i.formula))
+        else:
+            continue
+        # print(i.formula)
+        if have_metal_metal(i):
+            continue
+        else:
+            time += 1
+            result = remove_metal_from_component(i)
+            # number_O_dict.update(result[1])
+            # number_O_name.append(list(result[3]))
+            result2 = result[2]
+            result0 = result[0]
+            all_number[identifier] = number_O_dict
+            # 判断是否只有一种金属原子
+            if len(result2)>1:
+                continue
+            elif str(result[3])=="None":
+                continue
+            else:
+                # print(result[3])
+                # print(i.formula)
+                # excel_data.update(count_and_output(result0, output_folder, identifier))
+                # if "None" in result[3]:
+                #     continue
+                result_df = pd.DataFrame.from_dict(count_and_output(result0, output_folder, identifier,result[3],result[4]))
+                all_excel_data = pd.concat([all_excel_data, result_df], ignore_index=True)
+                # mol2 = hp.Molecule.read_from(f"/home/qyl/CSD_data/Cu_CSD1/{identifier}_{metal_name.atomic_symbol}_{yang}.mol2", "mol2")
+                # mol2.remove_solvents()
+                # mol2.retrieve_metal_ligand_pairs()
+                # mol2.remove_solvents()
+                # # t=mol2.remove_solvents()
+                # # mol2.writefile(f"/home/qyl/CSD_data/try_molll/{identifier}_{metal_name.atomic_symbol}_{yang}.mol2")
+                # mol2.writefile("mol2", path_file="/home/qyl/CSD_data/Cu_CSD1/1.mol2")
+# print(all_solvents_list,mol_solvents_list)
+excel_output_path = os.path.join(output_folder, "output_deduped9.xlsx")
+all_excel_data.to_excel(excel_output_path, index=False)
+# excel_file_path = "/home/qyl/CSD_data/csd5/excel_file.xlsx"
+# wb = Workbook()
+# ws = wb.active
+#
+# for identifier, number_O_dict in all_number.items():
+#     if any((value >0) for value in number_O_dict.values()):
+#         time+=1
+# # if number_O_dict[number_O_name[0]] != 0:
+#     # ws.append([f"{identifier}的{number_O_dict}"])
+#         ws[f"A{time}"] = identifier
+#         ws[f"B{time}"] = str(list(number_O_dict.keys()))
+#         ws[f"C{time}"] = str(list(number_O_dict.values()))
+# wb.save(filename=excel_file_path)
+
+# end_time = time.time()
+# execution_time = end_time - start_time
+# print("代码执行时间：", execution_time, "秒")
+
+
