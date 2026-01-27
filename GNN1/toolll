@@ -1,1 +1,196 @@
+import copy
+import os
+
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import accuracy_score
+from sklearn.neighbors import LocalOutlierFactor
+from torch.nn.utils import clip_grad_norm_
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import torch.optim as optim
+from torch.utils.data import SubsetRandomSampler
+
+from process_data_rf import process_data
+from model_rf import GNN
+from train_plus import train_and_evaluate,evaluate
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import torch.nn as nn
+from torch_geometric.loader import DataLoader
+
+import torch
+from torch_geometric.data import Data, Batch
+import seaborn as sns
+from sklearn.model_selection import train_test_split, KFold
+import matplotlib.pyplot as plt
+import argparse
+import shap
+import numpy as np
+import random
+from rdkit import RDLogger, DataStructs
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+
+#数据增广可视化部分
+def collect_features(data_list):
+    features = []
+    max_length = 0
+    for i, data in enumerate(data_list):
+        if hasattr(data, 'x'):
+            if isinstance(data.x, torch.Tensor):
+                feature = data.x.cpu().numpy().flatten()
+            else:
+                feature = data.x.flatten()
+            features.append(feature)
+            max_length = max(max_length, len(feature))
+            print(f"Data point {i}: feature length = {len(feature)}")
+
+    # Pad features to have the same length
+    padded_features = []
+    for i, feature in enumerate(features):
+        padded_feature = np.pad(feature, (0, max_length - len(feature)), 'constant')
+        padded_features.append(padded_feature)
+        print(f"Padded feature {i}: length = {len(padded_feature)}")
+
+    return np.array(padded_features)
+
+
+def visualize_data_augmentation(original_data, augmented_data, method='pca'):
+    original_count = len(original_data)
+    augmented_count = len(augmented_data)
+
+    print(f"Number of original data points: {original_count}")
+    print(f"Number of augmented data points: {augmented_count}")
+
+    # Collect features
+    print("Collecting original features:")
+    original_features = collect_features(original_data)
+    print("\nCollecting augmented features:")
+    augmented_features = collect_features(augmented_data)
+
+    print(f"Shape of original features: {original_features.shape}")
+    print(f"Shape of augmented features: {augmented_features.shape}")
+
+    # Ensure both feature sets have the same number of features
+    min_features = min(original_features.shape[1], augmented_features.shape[1])
+    original_features = original_features[:, :min_features]
+    augmented_features = augmented_features[:, :min_features]
+
+    print(f"Adjusted shape of original features: {original_features.shape}")
+    print(f"Adjusted shape of augmented features: {augmented_features.shape}")
+
+    # Combine features
+    all_features = np.vstack((original_features, augmented_features))
+
+    # Perform dimensionality reduction
+    if 'pca' in str(method):
+        reducer = PCA(n_components=2)
+    elif 'tsne' in str(method):
+        reducer = TSNE(n_components=2, random_state=42)
+    else:
+        raise ValueError("Method must be either 'pca' or 'tsne'")
+
+    reduced_features = reducer.fit_transform(all_features)
+
+    # Split back into original and augmented
+    original_reduced = reduced_features[:original_count]
+    augmented_reduced = reduced_features[original_count:]
+
+    # Plot function
+    def plot_data(original, augmented, title, original_color, augmented_color):
+        plt.figure(figsize=(10, 8))
+        plt.scatter(original[:, 0], original[:, 1], c=original_color, label='Original', alpha=0.6)
+        plt.scatter(augmented[:, 0], augmented[:, 1], c=augmented_color, label='Augmented', alpha=0.6)
+        plt.title(f'Original vs Augmented Data {title} ({method.upper()})')
+        plt.xlabel('Component 1')
+        plt.ylabel('Component 2')
+        plt.legend()
+
+        # Add data counts to the top left corner
+        plt.text(0.02, 0.98, f'Original: {original_count}\nAugmented: {augmented_count}',
+                 transform=plt.gca().transAxes, verticalalignment='top',
+                 fontsize=10, bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+
+        plt.show()
+
+        # Plot both versions
+
+    plot_data(original_reduced, augmented_reduced, '1', 'blue', 'red')
+    plot_data(original_reduced, augmented_reduced, '2', 'red', 'blue')
+
+#数据增广部分
+def feature_transformation(data, scale_range=(0.8, 1.2)):
+    """
+    Apply a more significant feature transformation.
+
+    Args:
+    - data: The input data
+    - scale_range: A tuple (min, max) for the scaling factor range
+
+    Returns:
+    - Transformed data
+    """
+    if hasattr(data, 'x'):
+        scale_factors = torch.FloatTensor(data.x.size(1)).uniform_(*scale_range)
+        data.x *= scale_factors
+
+    return data
+
+
+def add_gaussian_noise(data, mean=0.0, std_range=(0.05, 0.15)):
+    """
+    Add Gaussian noise with a range of standard deviations.
+
+    Args:
+    - data: The input data
+    - mean: Mean of the Gaussian noise
+    - std_range: A tuple (min, max) for the standard deviation range
+
+    Returns:
+    - Data with added noise
+    """
+    std = np.random.uniform(*std_range)
+    noise = torch.randn_like(data.x) * std + mean
+    data.x += noise
+    return data
+
+
+def random_feature_mask(data, mask_prob=0.1):
+    """
+    Randomly mask (set to zero) some features.
+
+    Args:
+    - data: The input data
+    - mask_prob: Probability of masking each feature
+
+    Returns:
+    - Data with masked features
+    """
+    mask = torch.rand_like(data.x) > mask_prob
+    data.x *= mask.float()
+    return data
+
+
+def augment_data(data):
+    """
+    Apply a combination of augmentation techniques.
+
+    Args:
+    - data: The input data
+
+    Returns:
+    - Augmented data
+    """
+    data_copy = copy.deepcopy(data)
+
+    # Randomly choose augmentation methods
+    augmentations = [feature_transformation, add_gaussian_noise, random_feature_mask]
+    num_augmentations = np.random.randint(1, len(augmentations) + 1)
+    chosen_augmentations = np.random.choice(augmentations, num_augmentations, replace=False)
+
+    for aug_func in chosen_augmentations:
+        data_copy = aug_func(data_copy)
+
+    return data_copy
 
