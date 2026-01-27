@@ -6,7 +6,6 @@ import json
 import logging
 import math
 from collections import defaultdict
-from matplotlib.gridspec import GridSpec
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -1347,6 +1346,91 @@ def save_results(generated, reference_smiles, config):
     print(f"结果已保存至 {config['paths']['output_path']}")
 
 
+def load_pretrained_model(model_class, config_path, model_path=None):
+    """
+    加载预训练模型
+
+    参数:
+        model_class: 模型类 (VAE)
+        config_path: 配置文件路径
+        model_path: 预训练模型路径 (可选，如果为None则创建新模型)
+
+    返回:
+        model: 加载好的模型
+        charset: 字符集
+        config: 配置字典
+    """
+    # 加载配置
+    config = load_config(config_path)
+
+    # 加载主数据集构建字符集
+    main_df = pd.read_excel(config['paths']['main_data_path'],
+                            sheet_name=config['data']['main_sheet'])
+    main_smiles = filter_valid(main_df[config['data']['smiles_column']].tolist())
+    charset = build_vocab(main_smiles)
+
+    # 初始化模型
+    device = torch.device(config['training']['device'])
+    model = model_class(
+        vocab_size=len(charset),
+        latent_dim=config['model']['latent_dim'],
+        embedding_dim=config['model']['embedding_dim'],
+        hidden_dim=config['model']['hidden_dim'],
+        num_layers=config['model']['num_layers'],
+        dropout=config['model']['dropout']
+    ).to(device)
+
+    # 如果提供了模型路径，则加载权重
+    if model_path:
+        try:
+            model.load_state_dict(torch.load(model_path))
+            print(f"成功加载预训练模型: {model_path}")
+        except Exception as e:
+            print(f"加载模型失败: {str(e)}")
+            print("将使用随机初始化的模型")
+
+    return model, charset, config
+
+
+def fine_tune_existing_model(model_path, config_path, fine_tune_smiles):
+    """
+    微调现有模型
+
+    参数:
+        model_path: 预训练模型路径
+        config_path: 配置文件路径
+        fine_tune_smiles: 用于微调的SMILES列表
+
+    返回:
+        fine_tuned_model: 微调后的模型
+    """
+    # 加载模型和配置
+    model, charset, config = load_pretrained_model(VAE, config_path, model_path)
+
+    # 过滤并标准化微调数据
+    ft_smiles = filter_valid(fine_tune_smiles)
+    print(f"有效微调SMILES数量: {len(ft_smiles)}")
+
+    # 加载主数据集(用于联合训练)
+    main_df = pd.read_excel(config['paths']['main_data_path'],
+                            sheet_name=config['data']['main_sheet'])
+    main_smiles = filter_valid(main_df[config['data']['smiles_column']].tolist())
+
+    # 微调模型
+    fine_tuned_model = fine_tune(
+        model=model,
+        main_data=main_smiles,
+        fine_tune_data=ft_smiles,
+        epochs=config['training']['ft_epochs'],
+        lr=config['training']['ft_lr'],
+        beta=config['training']['ft_beta'],
+        checkpoint_path=os.path.join(config['paths']['checkpoint_dir'], 'custom_finetune.pth'),
+        partial_unfreeze=config['training']['partial_unfreeze']
+    )
+
+    return fine_tuned_model, charset
+
+
 
 def save_model_and_charset(model, charset, model_path, charset_path):
     """保存模型和字符集"""
@@ -1363,6 +1447,216 @@ def save_model_and_charset(model, charset, model_path, charset_path):
     except Exception as e:
         print(f"保存失败: {str(e)}")
         raise
+
+
+def load_model_and_charset(model_class, model_path, charset_path, model_args):
+    """加载模型和字符集"""
+    try:
+        # 加载字符集
+        with open(charset_path, 'r', encoding='utf-8') as f:
+            charset = json.load(f)
+
+        # 初始化模型
+        model = model_class(**model_args)
+        model.load_state_dict(torch.load(model_path))
+        model.eval()
+
+        print(f"成功加载模型和字符集")
+        return model, charset
+
+    except FileNotFoundError:
+        print(f"文件未找到，请检查路径: {model_path} 或 {charset_path}")
+        raise
+    except Exception as e:
+        print(f"加载失败: {str(e)}")
+        raise
+
+#
+# def visualize_advanced_metrics(checkpoint_dir):
+#     """增强版训练指标可视化"""
+#     metrics = pd.read_csv(f"{checkpoint_dir}/metrics.csv")
+#
+#     plt.figure(figsize=(18, 12))
+#
+#     # 损失曲线（对数坐标）
+#     plt.subplot(2, 3, 1)
+#     plt.semilogy(metrics['epoch'], metrics['loss'], label='Total Loss')
+#     plt.semilogy(metrics['epoch'], metrics['recon_loss'], label='Recon Loss')
+#     plt.semilogy(metrics['epoch'], metrics['kl_loss'], label='KL Loss')
+#     plt.xlabel('Epoch')
+#     plt.ylabel('Loss (log scale)')
+#     plt.legend()
+#     plt.title('Training Loss Trajectory')
+#
+#     # KL权重与损失比率
+#     plt.subplot(2, 3, 2)
+#     plt.plot(metrics['epoch'], metrics['beta'], 'r-', label='KL Weight')
+#     plt.twinx()
+#     ratio = metrics['kl_loss'] / metrics['recon_loss']
+#     plt.plot(metrics['epoch'], ratio, 'g--', label='KL/Recon Ratio')
+#     plt.ylabel('Ratio')
+#     plt.title('KL Weight vs Loss Ratio')
+#     plt.legend()
+#
+#     # 梯度动态
+#     plt.subplot(2, 3, 3)
+#     plt.plot(metrics['epoch'], metrics['grad_norm'], 'b-o', markersize=4)
+#     plt.yscale('log')
+#     plt.xlabel('Epoch')
+#     plt.ylabel('Gradient Norm (log)')
+#     plt.title('Gradient Flow Dynamics')
+#
+#     # 学习率变化
+#     plt.subplot(2, 3, 4)
+#     plt.plot(metrics['epoch'], metrics['lr'], 'm-')
+#     plt.xlabel('Epoch')
+#     plt.ylabel('Learning Rate')
+#     plt.title('Learning Rate Schedule')
+#
+#     # Teacher Forcing比例
+#     plt.subplot(2, 3, 5)
+#     plt.plot(metrics['epoch'], metrics['teacher_forcing'], 'c-')
+#     plt.xlabel('Epoch')
+#     plt.ylabel('Teacher Forcing Ratio')
+#     plt.title('Teacher Forcing Scheduling')
+#
+#     # 参数分布直方图（示例）
+#     plt.subplot(2, 3, 6)
+#     sns.histplot(metrics['kl_loss'], kde=True, color='purple')
+#     plt.xlabel('KL Loss Value')
+#     plt.title('KL Loss Distribution')
+#
+#     plt.tight_layout()
+#     plt.savefig(f"{checkpoint_dir}/advanced_metrics.png")
+#     plt.close()
+#
+#
+# def visualize_molecule_grid(smiles_list, title, filename, mols_per_row=5, sub_img_size=(300, 300)):
+#     """分子结构网格可视化"""
+#     valid_mols = []
+#     legends = []
+#     for i, s in enumerate(smiles_list):
+#         mol = Chem.MolFromSmiles(s)
+#         if mol:
+#             valid_mols.append(mol)
+#             legends.append(f"Mol {i + 1}")
+#
+#     if len(valid_mols) == 0:
+#         print(f"No valid molecules to plot for {title}")
+#         return
+#
+#     img = Draw.MolsToGridImage(
+#         valid_mols[:mols_per_row * 3],  # 最多显示3行
+#         legends=legends[:mols_per_row * 3],
+#         molsPerRow=mols_per_row,
+#         subImgSize=sub_img_size,
+#         returnPNG=False
+#     )
+#     img.save(filename)
+#     print(f"Saved {filename}")
+#
+#
+# def visualize_latent_distribution(model, dataset, num_bins=20):
+#     """潜在向量分布直方图"""
+#     device = next(model.parameters()).device
+#     dataloader = DataLoader(dataset, batch_size=256, shuffle=False)
+#
+#     mus = []
+#     with torch.no_grad():
+#         for batch in dataloader:
+#             batch = batch.to(device)
+#             mu, _ = model.encode(batch)
+#             mus.append(mu.cpu())
+#
+#     all_mu = torch.cat(mus, dim=0).numpy()
+#
+#     plt.figure(figsize=(12, 6))
+#     plt.hist(all_mu.flatten(), bins=num_bins, alpha=0.7, color='blue', edgecolor='black')
+#     plt.xlabel('Latent Variable Value')
+#     plt.ylabel('Frequency')
+#     plt.title('Latent Space Value Distribution')
+#     plt.grid(True)
+#     return plt
+#
+#
+# def visualize_property_radar(generated_smiles, reference_smiles, props_list, filename):
+#     """分子属性雷达图对比"""
+#
+#     def calc_prop_stats(smiles_list):
+#         stats = {prop: [] for prop in props_list}
+#         for s in smiles_list:
+#             mol = Chem.MolFromSmiles(s)
+#             if mol:
+#                 for prop in props_list:
+#                     try:
+#                         stats[prop].append(getattr(Descriptors, prop)(mol))
+#                     except:
+#                         pass
+#         return {k: (np.mean(v), np.std(v)) for k, v in stats.items() if len(v) > 0}
+#
+#     ref_stats = calc_prop_stats(reference_smiles)
+#     gen_stats = calc_prop_stats(generated_smiles)
+#
+#     labels = list(ref_stats.keys())
+#     ref_means = [ref_stats[k][0] for k in labels]
+#     gen_means = [gen_stats.get(k, (0, 0))[0] for k in labels]
+#
+#     angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
+#
+#     fig = plt.figure(figsize=(8, 8))
+#     ax = fig.add_subplot(111, polar=True)
+#     ax.plot(angles, ref_means, 'b-', label='Reference')
+#     ax.plot(angles, gen_means, 'r-', label='Generated')
+#     ax.fill(angles, ref_means, 'b', alpha=0.1)
+#     ax.fill(angles, gen_means, 'r', alpha=0.1)
+#     ax.set_xticks(angles)
+#     ax.set_xticklabels(labels)
+#     plt.title('Molecular Property Radar Chart')
+#     plt.legend()
+#     plt.savefig(filename)
+#     plt.close()
+#
+# # 在现有visualize_results函数中整合新功能
+# def visualize_results(model, main_smiles, ft_smiles, generated, charset, config):
+#     """整合所有可视化分析"""
+#     print("\n=== 执行高级可视化分析 ===")
+#     vis_dir = config['paths']['visualization_dir']
+#
+#     # 1. 增强指标可视化
+#     visualize_advanced_metrics(config['paths']['checkpoint_dir'])
+#
+#     # 2. 分子结构示例
+#     sample_size = min(20, len(generated))
+#     visualize_molecule_grid(
+#         generated[:sample_size],
+#         "Generated Molecules",
+#         f"{vis_dir}/generated_molecules1.png"
+#     )
+#
+#     # 3. 潜在空间分布
+#     combined_dataset = VAEDataset(main_smiles + ft_smiles, charset)
+#     plt = visualize_latent_distribution(model, combined_dataset)
+#     plt.savefig(f"{vis_dir}/latent_distribution1.png")
+#     plt.close()
+#
+#     # 4. 属性雷达图
+#     properties = ['MolWt', 'NumHAcceptors', 'NumHDonors', 'MolLogP', 'RingCount']
+#     visualize_property_radar(
+#         generated,
+#         main_smiles + ft_smiles,
+#         properties,
+#         f"{vis_dir}/property_radar1.png"
+#     )
+#
+#     # 5. 时间序列生成示例
+#     if len(generated) >= 5:
+#         timeline_smiles = [generated[i] for i in range(0, len(generated), len(generated) // 5)][:5]
+#         visualize_molecule_grid(
+#             timeline_smiles,
+#             "Generation Timeline",
+#             f"{vis_dir}/generation_timeline1.png",
+#             mols_per_row=5
+#         )
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1414,52 +1708,112 @@ from rdkit import Chem
 from rdkit.Chem import AllChem, Draw, Descriptors
 from sklearn.manifold import TSNE
 from sklearn.neighbors import NearestNeighbors # 导入用于寻找最近邻的库
+# --- Function 1: Chemical Space Plot (Now returns annotated SMILES) ---
+def visualize_chemical_space(df, output_dir='visualizations', num_outliers_to_show=7):
+    """
+    Visualize chemical space (t-SNE), highlighting the most isolated 'outlier' molecules
+    for better aesthetics and interpretation, and return their SMILES.
+    """
+    print("--- Running Chemical Space Visualization with Outlier Highlighting ---")
+    os.makedirs(output_dir, exist_ok=True)
+    if df.empty:
+        print("Input DataFrame is empty, skipping chemical space plot.")
+        return []
 
+        # --- 1. Data Preparation (same as before) ---
+    fingerprints, valid_indices = [], []
+    for i, smiles in enumerate(df['New_SMILES']):
+        mol = Chem.MolFromSmiles(smiles)
+        if mol:
+            fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=512)
+            fingerprints.append(fp)
+            valid_indices.append(i)
 
-import matplotlib as mpl
-import seaborn as sns
+    if not fingerprints:
+        print("No valid SMILES found, skipping chemical space plot.")
+        return []
 
-def set_publication_style_tnr():
-    """Set global publication style with Times New Roman font."""
+    df_valid = df.iloc[valid_indices].reset_index(drop=True)
+    fp_array = np.array(fingerprints)
 
-    mpl.rcParams.update({
-        # ---------------- Font family ----------------
-        'font.family': 'serif',
-        'font.serif': ['Times New Roman'],
+    perplexity_value = min(30, len(fp_array) - 1)
+    if perplexity_value <= 0:
+        print("Not enough data points for t-SNE, skipping plot.")
+        return []
 
-        # ---------------- Font sizes ----------------
-        'font.size': 12,
-        'axes.titlesize': 16,
-        'axes.titleweight': 'bold',
-        'axes.labelsize': 14,
-        'xtick.labelsize': 12,
-        'ytick.labelsize': 12,
-        'legend.fontsize': 12,
-        'figure.titlesize': 16,
+    tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity_value)
+    tsne_result = tsne.fit_transform(fp_array)
 
-        # ---------------- Figure & saving ----------------
-        'figure.dpi': 100,
-        'savefig.dpi': 300,
-        'savefig.bbox': 'tight',
-
-        # ---------------- Lines & markers ----------------
-        'lines.linewidth': 2.0,
-        'lines.markersize': 6,
-
-        # ---------------- Grid ----------------
-        'axes.grid': True,
-        'grid.linestyle': '--',
-        'grid.alpha': 0.5,
-
-        # ---------------- Axes ----------------
-        'axes.spines.top': False,
-        'axes.spines.right': False,
-
-        # ---------------- Legend ----------------
-        'legend.frameon': False,
+    tsne_df = pd.DataFrame({
+        'TSNE1': tsne_result[:, 0],
+        'TSNE2': tsne_result[:, 1],
+        'Metal_Difference': df_valid['Metal_Difference'],
+        'New_SMILES': df_valid['New_SMILES']
     })
 
-    sns.set_style("whitegrid")
+    # --- 2. Find Outliers (New Logic) ---
+    # We define 'outliers' as points in the sparsest regions of the plot.
+    # We use NearestNeighbors to find the distance to the k-th nearest neighbor for each point.
+    # A large distance indicates a sparse region.
+    nn = NearestNeighbors(n_neighbors=6)  # Check 5 nearest neighbors + the point itself
+    nn.fit(tsne_df[['TSNE1', 'TSNE2']])
+    distances, _ = nn.kneighbors(tsne_df[['TSNE1', 'TSNE2']])
+
+    # Get the distance to the 5th neighbor as a proxy for local density
+    tsne_df['density_distance'] = distances[:, 5]
+
+    # Sort by this distance to find the most isolated points
+    molecules_to_annotate = tsne_df.sort_values('density_distance', ascending=False).head(num_outliers_to_show)
+    annotated_smiles = molecules_to_annotate['New_SMILES'].tolist()
+
+    # --- 3. Aesthetic Plotting ---
+    fig, ax = plt.subplots(figsize=(14, 11))
+    cmap = 'viridis'
+
+    # a) Plot all points as a "background" layer: smaller and more transparent
+    ax.scatter(tsne_df['TSNE1'], tsne_df['TSNE2'], c=tsne_df['Metal_Difference'], cmap=cmap, s=40, alpha=0.4,
+               edgecolors='w', linewidths=0.5)
+
+    # b) Highlight the outlier points: larger, opaque, with a distinct border
+    ax.scatter(molecules_to_annotate['TSNE1'], molecules_to_annotate['TSNE2'],
+               c=molecules_to_annotate['Metal_Difference'], cmap=cmap, s=150, alpha=1,
+               edgecolors='red', linewidths=2)
+
+    # c) Add beautiful annotations for the highlighted points
+    for _, row in molecules_to_annotate.iterrows():
+        ax.annotate(row['New_SMILES'],
+                    (row['TSNE1'], row['TSNE2']),
+                    textcoords="offset points",
+                    xytext=(10, 10),
+                    ha='left',
+                    fontsize=10,
+                    arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=.3", color='black'),
+                    bbox=dict(boxstyle="round,pad=0.3", fc="ivory", ec="black", lw=0.5, alpha=0.8)  # Nicer box
+                    )
+
+        # --- 4. Final Touches ---
+    ax.set_xlabel('t-SNE Component 1', fontsize=14)
+    ax.set_ylabel('t-SNE Component 2', fontsize=14)
+    ax.set_title('Chemical Space Distribution with Outlier Highlighting', fontsize=18, fontweight='bold', pad=20)
+
+    # Add a clean color bar
+    norm = plt.Normalize(df['Metal_Difference'].min(), df['Metal_Difference'].max())
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, pad=0.01, fraction=0.046)
+    cbar.set_label('Metal Environment Difference', fontsize=14, labelpad=15)
+
+    ax.grid(True, linestyle='--', alpha=0.3)
+    plt.tight_layout()
+
+    output_path = os.path.join(output_dir, 'chemical_space_tsne_with_outliers.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Enhanced chemical space plot saved to {output_path}")
+
+    return annotated_smiles
+
+
 # --- Function 2: Molecule Grid Plot (Adapted to include required molecules) ---
 def visualize_molecule_grid(df, required_smiles, grid_size=12, output_dir='visualizations'):
     """
@@ -1531,36 +1885,73 @@ def visualize_molecule_grid(df, required_smiles, grid_size=12, output_dir='visua
     plt.close()
     print(f"Molecule grid plot saved to {output_path}")
 
+# def visualize_chemical_space(df, output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6/sar_visualizations'):
+#     """Visualize chemical space distribution using t-SNE, separated by Metal_Difference."""
+#
+#     metal_differences = [0, 1, 2]
+#
+#     for metal_diff in metal_differences:
+#         # Filter the DataFrame for the current Metal_Difference value
+#         df_subset = df[df['Metal_Difference'] == metal_diff]
+#
+#         # If the subset is empty, skip it.
+#         if df_subset.empty:
+#             print(f"No data points with Metal_Difference = {metal_diff}, skipping plot.")
+#             continue
+#
+#         fig, ax = plt.subplots(figsize=(10, 8))
+#
+#         # Generate molecule fingerprints
+#         fingerprints = []
+#         valid_smiles = []
+#         for smiles in df_subset['New_SMILES']:
+#             mol = Chem.MolFromSmiles(smiles)
+#             if mol:
+#                 fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=512)
+#                 fingerprints.append(fp)
+#                 valid_smiles.append(smiles)
+#
+#         # If there is no valid smiles, skip it.
+#         if not fingerprints:
+#             print(f"No valid smiles with Metal_Difference = {metal_diff}, skipping plot.")
+#             continue
+#
+#         # Convert to array
+#         fp_array = np.array(fingerprints)
+#
+#         # t-SNE dimensionality reduction
+#         tsne = TSNE(n_components=2, random_state=42)  # You can adjust parameters like perplexity
+#         tsne_result = tsne.fit_transform(fp_array)
+#
+#         # Create result DataFrame
+#         tsne_df = pd.DataFrame({
+#             'TSNE1': tsne_result[:, 0],
+#             'TSNE2': tsne_result[:, 1],
+#         })
+#
+#         # Plot scatter plot
+#         scatter = ax.scatter(
+#             tsne_df['TSNE1'],
+#             tsne_df['TSNE2'],
+#             #c=df_subset.loc[df_subset['New_SMILES'].isin(valid_smiles), 'Metal_Difference'],
+#             cmap=cmap,
+#             s=50,  # Increased point size
+#             alpha=0.7,  # Adjusted opacity
+#             edgecolors='w'
+#         )
+#
+#         ax.set_xlabel('t-SNE Component 1', fontsize=14)
+#         ax.set_ylabel('t-SNE Component 2', fontsize=14)
+#
+#         # Add color bar (only if Metal_Difference varies within the subset)
+#         if len(df_subset['Metal_Difference'].unique()) > 1:
+#             cbar = plt.colorbar(scatter, ax=ax, pad=0.01)
+#             cbar.set_label('Metal Environment Difference', fontsize=14, labelpad=10)
+#
+#         ax.set_title(f'Chemical Space Distribution (t-SNE) - Metal Diff = {metal_diff}', fontsize=16, fontweight='bold', pad=20)
+#         plt.savefig(os.path.join(output_dir, f'chemical_space_tsne_metal_diff_{metal_diff}.png'), dpi=300, bbox_inches='tight')
+#         plt.close()
 
-def visualize_chemical_space(df, output_dir):
-    if df.empty:
-        return
-
-    fps, diffs = [], []
-    for _, row in df.iterrows():
-        mol = Chem.MolFromSmiles(row['New_SMILES'])
-        if mol:
-            fps.append(AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=512))
-            diffs.append(row['Metal_Difference'])
-
-    if not fps:
-        return
-
-    tsne = TSNE(n_components=2, random_state=42)
-    coords = tsne.fit_transform(np.array(fps))
-
-    fig, ax = plt.subplots(figsize=(12, 8))
-    sc = ax.scatter(coords[:, 0], coords[:, 1], c=diffs, cmap=cmap, alpha=0.7, edgecolors='w')
-
-    ax.set_xlabel('t-SNE Component 1')
-    ax.set_ylabel('t-SNE Component 2')
-
-    cbar = plt.colorbar(sc, ax=ax, pad=0.01)
-    cbar.set_label('Metal Environment Difference')
-
-    ax.set_title('Chemical Space Distribution (t-SNE)')
-    plt.savefig(os.path.join(output_dir, 'chemical_space_tsne.png'))
-    plt.close()
 def visualize_property_distribution(df, output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/sar_visualizations'):
     """Visualize property difference distribution."""
     fig, ax = plt.subplots(figsize=(10, 8))
@@ -1636,168 +2027,87 @@ def visualize_similarity_vs_difference(df, output_dir='/home/qyl/CSD_data/1_CSD/
     plt.savefig(os.path.join(output_dir, 'similarity_vs_difference.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
+def visualize_scaffold_distribution(df, output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/sar_visualizations'):
+    """Visualize molecule scaffold distribution."""
+    fig, ax = plt.subplots(figsize=(12, 8))  # Increased figure width
 
-
-def visualize_scaffold_distribution(
-    df,
-    output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/sar_visualizations',
-    show_structures=True
-):
-    """
-    Visualize molecule scaffold distribution:
-    - Left: Top 10 scaffold frequency (indexed as Scaffold 1, 2, ...)
-    - Right (optional): Top 5 valid Murcko scaffolds (enlarged)
-    """
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # -------------------------------------------------
-    # 1. Extract Murcko scaffolds
-    # -------------------------------------------------
+    # Extract molecule scaffolds
     scaffolds = {}
     for _, row in df.iterrows():
         mol = Chem.MolFromSmiles(row['New_SMILES'])
         if mol:
             try:
-                scaffold_mol = MurckoScaffold.GetScaffoldForMol(mol)
-                if scaffold_mol is None:
-                    continue
-
-                scaffold_smiles = Chem.MolToSmiles(scaffold_mol)
-
-                if scaffold_smiles not in scaffolds:
-                    scaffolds[scaffold_smiles] = {
+                # Get Murcko scaffold
+                scaffold = Chem.MolToSmiles(Chem.Scaffolds.MurckoScaffold.GetScaffoldForMol(mol))
+                if scaffold not in scaffolds:
+                    scaffolds[scaffold] = {
                         'count': 0,
-                        'avg_difference': 0.0
+                        'avg_difference': 0,
+                        'molecules': []
                     }
 
-                scaffolds[scaffold_smiles]['count'] += 1
-                scaffolds[scaffold_smiles]['avg_difference'] += row['Metal_Difference']
-
-            except Exception:
+                scaffolds[scaffold]['count'] += 1
+                scaffolds[scaffold]['avg_difference'] += row['Metal_Difference']
+                scaffolds[scaffold]['molecules'].append(row['New_SMILES'])
+            except:
                 continue
 
-    if not scaffolds:
-        print("No valid scaffolds found. Skipping visualization.")
-        return
-
+    # Calculate average difference
     for scaffold in scaffolds:
         scaffolds[scaffold]['avg_difference'] /= scaffolds[scaffold]['count']
 
+    # Convert to DataFrame and sort
     scaffold_df = pd.DataFrame.from_dict(scaffolds, orient='index')
     scaffold_df = scaffold_df.sort_values('count', ascending=False).head(10)
 
-    # -------------------------------------------------
-    # 2. Generate generic scaffold labels
-    # -------------------------------------------------
-    scaffold_df = scaffold_df.copy()
-    scaffold_df['Scaffold_Label'] = [
-        f"Scaffold {i + 1}" for i in range(len(scaffold_df))
-    ]
-
-    # -------------------------------------------------
-    # 3. Select top 5 VALID scaffolds (for optional right panel)
-    # -------------------------------------------------
-    top5_scaffold_mols = []
-    if show_structures:
-        for scaffold_smiles in scaffold_df.index:
-            mol = Chem.MolFromSmiles(scaffold_smiles)
-            if mol is not None:
-                top5_scaffold_mols.append(mol)
-            if len(top5_scaffold_mols) == 5:
-                break
-
-    # -------------------------------------------------
-    # 4. Figure layout
-    # -------------------------------------------------
-    if show_structures:
-        fig = plt.figure(figsize=(17, 9))
-        gs = GridSpec(1, 2, width_ratios=[2.6, 1.4], wspace=0.25)
-        ax_bar = fig.add_subplot(gs[0])
-    else:
-        fig = plt.figure(figsize=(12, 8))
-        gs = GridSpec(1, 1)
-        ax_bar = fig.add_subplot(gs[0])
-
-    # =========================
-    # Left panel: barh (TOP 10)
-    # =========================
-    ax_bar.barh(
-        scaffold_df['Scaffold_Label'],
+    # Plot scaffold distribution
+    bars = ax.barh(
+        scaffold_df.index.astype(str),
         scaffold_df['count'],
         color=plt.cm.viridis(np.linspace(0, 1, len(scaffold_df)))
     )
 
-    ax_bar.invert_yaxis()
-    ax_bar.set_xlabel('Frequency')
-    ax_bar.set_title('Top 10 Common Molecule Scaffolds')
+    # Add average difference value - Adjusted placement and formatting
+    for i, (scaffold, row) in enumerate(scaffold_df.iterrows()):
+        ax.text(row['count'] + scaffold_df['count'].max()*0.02, i, f"{row['avg_difference']:.3f}",  # Adjusted placement
+                va='center', fontsize=12, color='darkred')
 
-    max_count = scaffold_df['count'].max()
+    ax.set_xlabel('Frequency', fontsize=14) # Increased fontsize
+    ax.set_title('Top 10 Common Molecule Scaffolds', fontsize=16) # Increased fontsize
+    ax.invert_yaxis()
+    ax.margins(y=0.05) # Add space around bars
+    plt.tight_layout()
 
-    for i, (_, row) in enumerate(scaffold_df.iterrows()):
-        if row['count'] > 0.9 * max_count:
-            # ✅ 最大的 bar：数值放在 bar 内部
-            x_pos = row['count'] - max_count * 0.08
-            ha = 'right'
-            text_color = 'white'
-        else:
-            # ✅ 其余 bar：数值放在 bar 外部
-            x_pos = row['count'] + max_count * 0.02
-            ha = 'left'
-            text_color = 'darkred'
+    # Add scaffold images
+    mol_ax = ax.inset_axes([1.05, 0, 0.7, 1])  # Increased width
+    mol_ax.axis('off')
 
-        ax_bar.text(
-            x_pos,
-            i,
-            f"{row['avg_difference']:.3f}",
-            va='center',
-            ha=ha,
-            fontsize=12,
-            color=text_color
+    # Plot scaffold structures
+    mols = []
+    legends = []
+    for scaffold in scaffold_df.index:
+        mol = Chem.MolFromSmiles(scaffold)
+        if mol:
+            mols.append(mol)
+            legends.append(f"Count: {scaffold_df.loc[scaffold, 'count']}")
+
+    if mols:
+        img = Draw.MolsToGridImage(
+            mols,
+            molsPerRow=2,
+            subImgSize=(300, 300),  # Increased image size
+            legends=legends,
+            useSVG=False
         )
+        mol_ax.imshow(img)
 
-    # =====================================
-    # Right panel: Top 5 Murcko scaffolds
-    # =====================================
-    if show_structures and top5_scaffold_mols:
-        gs_right = GridSpec(
-            5, 1,
-            left=0.72, right=0.98,
-            top=0.94, bottom=0.06,
-            hspace=0.35
-        )
-
-        for i, mol in enumerate(top5_scaffold_mols):
-            ax = fig.add_subplot(gs_right[i])
-            img = Draw.MolToImage(
-                mol,
-                size=(380, 380),  # ✅ enlarged
-                kekulize=True
-            )
-            ax.imshow(img)
-            ax.axis('off')
-            ax.set_title(f"Scaffold {i + 1}")
-
-    # -------------------------------------------------
-    # 5. Save figure
-    # -------------------------------------------------
-    filename = (
-        'scaffold_distribution_top10_with_structures.png'
-        if show_structures
-        else 'scaffold_distribution_top10_contribution_only.png'
-    )
-
-    output_path = os.path.join(output_dir, filename)
-    plt.savefig(output_path, dpi=600, bbox_inches='tight')
+    ax.set_title('Molecule Scaffold Distribution', fontsize=16, fontweight='bold', pad=20) # Added title
+    plt.savefig(os.path.join(output_dir, 'scaffold_distribution.png'), dpi=300, bbox_inches='tight')
     plt.close()
-
-    print(f"Saved scaffold distribution figure to: {output_path}")
-    return scaffold_df
 
 def ensure_dir(directory):
     if not os.path.exists(directory):
         os.makedirs(directory)
-
 def visualize_and_export_scaffolds(df,
                                    output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/sar_visualizations'):
     """
@@ -1911,44 +2221,7 @@ def visualize_and_export_scaffolds(df,
     plt.close()
     print("可视化图生成成功。")
 
-def visualize_scaffold_structures_only(
-    scaffold_df,
-    output_dir,
-    top_n=5,
-    filename='representative_murcko_scaffolds.png'
-):
-    """
-    Visualize representative Murcko scaffold structures ONLY
-    as a standalone figure.
-    """
-    os.makedirs(output_dir, exist_ok=True)
 
-    scaffold_smiles = scaffold_df.index[:top_n]
-
-    mols = []
-    legends = []
-    for i, smi in enumerate(scaffold_smiles):
-        mol = Chem.MolFromSmiles(smi)
-        if mol:
-            mols.append(mol)
-            legends.append(f"Scaffold {i + 1}")
-
-    if not mols:
-        print("No valid scaffold molecules for structure visualization.")
-        return
-
-    img = Draw.MolsToGridImage(
-        mols,
-        molsPerRow=top_n,
-        subImgSize=(420, 420),
-        legends=legends,
-        useSVG=False
-    )
-
-    output_path = os.path.join(output_dir, filename)
-    img.save(output_path)
-
-    print(f"Saved standalone scaffold structure figure to: {output_path}")
 def visualize_mw_vs_difference(df, output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/sar_visualizations'):
     """Visualize the relationship between molecular weight and property difference."""
     fig, ax = plt.subplots(figsize=(10, 8))
@@ -2042,9 +2315,49 @@ def visualize_reward_trend(reward_history, output_dir='/home/qyl/CSD_data/1_CSD/
     plt.savefig(os.path.join(output_dir, 'reward_trend.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
+# def visualize_molecule_grid(df, top_n=12, output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6/sar_visualizations'):
+#     """Visualize molecule structure grid, colored by metal environment difference."""
+#     fig, ax = plt.subplots(figsize=(12, 10))
+#
+#     # Select the molecules with the largest differences
+#     top_molecules = df.sort_values('Metal_Difference', ascending=False).head(top_n)
+#
+#     # Prepare molecule images
+#     mols = []
+#     legends = []
+#     for _, row in top_molecules.iterrows():
+#         mol = Chem.MolFromSmiles(row['New_SMILES'])
+#         if mol:
+#             mols.append(mol)
+#             legends.append(f"Diff: {row['Metal_Difference']:.3f}\nSim: {row['Similarity_Score']:.2f}")
+#
+#     # Create molecule image grid
+#     img = Draw.MolsToGridImage(
+#         mols,
+#         molsPerRow=4,
+#         subImgSize=(350, 350), # Increased subImgSize
+#         legends=legends,
+#         useSVG=False,
+#         #mol_scale=1.0 # Add this line for consistent scaling
+#     )
+#
+#     # Display image in matplotlib
+#     ax.imshow(img)
+#     ax.axis('off')
+#
+#     # Add color bar to represent the degree of difference
+#     norm = plt.Normalize(df['Metal_Difference'].min(), df['Metal_Difference'].max())
+#     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+#     sm.set_array([])
+#
+#     cbar = plt.colorbar(sm, ax=ax, fraction=0.05, pad=0.01)
+#     cbar.set_label('Metal Environment Difference', fontsize=14, labelpad=10) # Increased fontsize
+#
+#     ax.set_title('Molecule Structures and Differences in Metal Environment', fontsize=16, fontweight='bold', pad=20) # Added title
+#     plt.savefig(os.path.join(output_dir, 'molecule_grid.png'), dpi=300, bbox_inches='tight')
+#     plt.close()
 
-def visualize_sar(final_df, reward_history=None,
-                  output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/base7/sar_visualizations'):
+def visualize_sar(final_df, reward_history=None, output_dir='/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/attn5/sar_visualizations'):
     """
     Comprehensive visualization of molecule structure-property relationship and save each image separately.
     :param final_df: DataFrame containing molecule information and property differences.
@@ -2055,6 +2368,8 @@ def visualize_sar(final_df, reward_history=None,
     import os
     os.makedirs(output_dir, exist_ok=True)
 
+
+
     # 2. Property difference distribution
     visualize_property_distribution(final_df, output_dir=output_dir)
 
@@ -2062,43 +2377,17 @@ def visualize_sar(final_df, reward_history=None,
     visualize_similarity_vs_difference(final_df, output_dir=output_dir)
 
     # 4. Chemical space distribution (t-SNE dimensionality reduction)
-    required = visualize_chemical_space(final_df, output_dir=output_dir)
+    required=visualize_chemical_space(final_df, output_dir=output_dir)
+
+    # 1. Molecule structure grid visualization (with property differences)
+    visualize_molecule_grid(final_df, required_smiles=required,output_dir=output_dir)
 
     # 5. Molecule scaffold analysis
-    # visualize_scaffold_distribution(final_df, output_dir=output_dir)
+    visualize_scaffold_distribution(final_df, output_dir=output_dir)
     visualize_and_export_scaffolds(df=final_df, output_dir=output_dir)
 
     # 6. Property difference vs. molecular weight relationship
     visualize_mw_vs_difference(final_df, output_dir=output_dir)
-
-
-    # 新增：对相似度>0.4且差异>0的分子进行骨架分布分析
-    # special_mask = (final_df['Similarity_Score'] > 0.4) & (final_df['Metal_Difference'] > 0)
-    special_mask = (final_df['Similarity_Score'] > 0.4) & (final_df['Similarity_Score'] < 1)
-
-    special_molecules = final_df[special_mask].copy()
-    if not special_molecules.empty:
-        print(f"高相似度且金属差异值>0的分子数量: {len(special_molecules)}，绘制专属骨架分布图")
-        special_scaffold_dir = os.path.join(output_dir, 'scaffold_special_0.4_3')
-
-        # 1️⃣ 先画 scaffold 频次分布（bar 图）
-        scaffold_df_special = visualize_scaffold_distribution(
-            special_molecules,
-            output_dir=special_scaffold_dir,
-            show_structures=False
-        )
-
-        # 2️⃣ 再单独画 scaffold 结构图
-        if scaffold_df_special is not None:
-            visualize_scaffold_structures_only(
-                scaffold_df_special,
-                output_dir=special_scaffold_dir,
-                top_n=10,
-                filename='representative_scaffolds_special.png'
-            )
-    else:
-        print("没有找到满足相似度>0.4且金属差异>0的分子，不生成专属骨架分布图。")
-    # visualize_molecule_grid(final_df, required_smiles=required, output_dir=output_dir)
 
     # 7. Reward trend (if provided)
     if reward_history:
@@ -3125,9 +3414,7 @@ class MoleculeWorkflow:
         parser.add_argument("--hidden_dim", type=int, default=128)
         parser.add_argument("--num_workers", type=int, default=0, help="Number of data loading workers")
         parser.add_argument("--record", type=str, default="5")
-        # parser.add_argument("--count", type=str, default="19111111")
-        parser.add_argument("--count", type=str, default="19111111111")
-
+        parser.add_argument("--count", type=str, default="19111111")
         parser.add_argument("--cc", type=str, default="333")
 
         args = parser.parse_args()
@@ -3513,7 +3800,7 @@ class MoleculeWorkflow:
                                       num_molecules_per_iteration: int = 500) -> pd.DataFrame:
         """分子精炼工作流 - 支持检查点恢复"""
         # 确保输出目录存在
-        output_dir = '/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/base7'
+        output_dir = '/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/attn5'
         os.makedirs(output_dir, exist_ok=True)
         # Add at the beginning:
         torch.cuda.empty_cache()
@@ -4324,6 +4611,40 @@ logger.setLevel(logging.INFO)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
+class BaselineValueNetwork(nn.Module):
+    """
+    基础价值网络：最简单、最基本的网络结构
+    特点：
+    1. 单层线性变换
+    2. 无非线性激活
+    3. 直接映射输入到价值
+    """
+
+    def __init__(self, input_dim):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, 1)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+
+
+
+class MediumValueNetwork(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 
 class AttentionEnhancedValueNetwork(nn.Module):
@@ -4377,6 +4698,7 @@ class Charset:
     def __getitem__(self, idx):
         """支持通过索引访问字符"""
         return self.index_to_char.get(idx, None)  # 返回索引对应的字符
+
 
 
 def main():
@@ -4481,7 +4803,7 @@ def main():
         config['paths']['main_data_path'],
         config,
         Charset(charset),
-        checkpoint_dir="/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/base7/checkpoints2/"
+        checkpoint_dir="/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/attn5/checkpoints2/"
     )
 
     # 执行分子精炼工作流
@@ -4490,14 +4812,12 @@ def main():
         num_molecules_per_iteration=1000
     )
     visualize_sar(refined_molecules, reward_history)
-    # # results = run_value_network_ablation(workflow)
-    # if isinstance(refined_molecules, pd.DataFrame) and refined_molecules.empty:
-    #     print("未生成任何有效数据，无法创建 Excel 文件")
-    # else:
-    #     result_df = pd.DataFrame({'Refined_Molecules': refined_molecules['SMILES']})
-    #     result_df.to_excel('/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/base7/checkpoints2/refined_molecules2.xlsx', index=False)
+    # results = run_value_network_ablation(workflow)
+    if isinstance(refined_molecules, pd.DataFrame) and refined_molecules.empty:
+        print("未生成任何有效数据，无法创建 Excel 文件")
+    else:
+        result_df = pd.DataFrame({'Refined_Molecules': refined_molecules['SMILES']})
+        result_df.to_excel('/home/qyl/CSD_data/1_CSD/logs/ensemble/4.10____4/iterations6_8_2_att1/attn5/checkpoints2/refined_molecules2.xlsx', index=False)
 
 if __name__ == "__main__":
     main()
-
-
