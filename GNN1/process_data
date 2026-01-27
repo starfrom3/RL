@@ -1,0 +1,366 @@
+import pickle
+import random
+
+import numpy as np
+import openbabel
+import torch
+from openbabel import openbabel
+from rdkit import Chem, DataStructs
+from rdkit.Chem import AllChem
+from sklearn.decomposition import PCA
+from torch_geometric.data import Data
+
+
+def obabel_smiles_to_mol(smiles):
+    """
+    使用 OpenBabel 将 SMILES 转换为 MolBlock，再由 RDKit 转换为 RDKit Mol 对象。
+    """
+    obConversion = openbabel.OBConversion()
+    obConversion.SetInAndOutFormats("smi", "mol")
+    obMol = openbabel.OBMol()
+
+    if obConversion.ReadString(obMol, smiles):
+        mol_block = obConversion.WriteString(obMol)
+        rdkit_mol = Chem.MolFromMolBlock(mol_block)
+        return rdkit_mol
+    else:
+        return None
+
+
+class MolecularDataProcessor:
+    """
+    用于处理分子数据并执行 PCA 降维的辅助类。
+    """
+    def __init__(self, n_components=50):
+        self.n_components = n_components
+        self.pca = None
+
+    def save_pca_model(self, filepath):
+        """
+        保存已训练好的 PCA 模型到文件。
+        """
+        if self.pca is None:
+            raise ValueError("PCA model has not been fit yet!")
+
+        with open(filepath, 'wb') as f:
+            pickle.dump(self.pca, f)
+
+        print(f"PCA model saved to {filepath}")
+
+    def load_pca_model(self, filepath):
+        """
+        从文件中加载已训练好的 PCA 模型。
+        """
+        try:
+            with open(filepath, 'rb') as f:
+                self.pca = pickle.load(f)
+
+            print(f"PCA model loaded from {filepath}")
+            print(f"Number of components: {self.pca.n_components_}")
+            print(f"Explained variance ratio: {np.sum(self.pca.explained_variance_ratio_):.4f}")
+        except Exception as e:
+            print(f"Error loading PCA model: {str(e)}")
+            raise
+
+    def compute_fingerprints(self, df):
+        """
+        针对 DataFrame 中的每条记录计算分子指纹（如使用 ECFP4）。
+        若 SMILES 无效，则填充为全零向量。
+        """
+        n_bits = 2048  # 指纹长度
+        fingerprints = []
+        invalid_count = 0
+
+        for _, row in df.iterrows():
+            smiles = row['SMILES']
+            if isinstance(smiles, str):
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is None:
+                    # 如果 RDKit 无法解析，尝试通过 OpenBabel 转换
+                    try:
+                        mol = obabel_smiles_to_mol(smiles)
+                    except:
+                        mol = None
+
+                if mol is not None:
+                    # 生成固定长度的指纹
+                    fingerprint = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=n_bits)
+                    fingerprint_array = np.zeros((n_bits,))
+                    DataStructs.ConvertToNumpyArray(fingerprint, fingerprint_array)
+                    fingerprints.append(fingerprint_array)
+                else:
+                    # 无法解析的 SMILES 计数
+                    print(f"Invalid molecule for SMILES: {smiles}")
+                    invalid_count += 1
+                    fingerprints.append(np.zeros((n_bits,)))
+            else:
+                print(f"Invalid SMILES value: {smiles}")
+                invalid_count += 1
+                fingerprints.append(np.zeros((n_bits,)))
+
+        print(f"Total invalid molecules: {invalid_count}")
+        fingerprints_array = np.stack(fingerprints)
+        print(f"Fingerprints shape: {fingerprints_array.shape}")
+        return fingerprints_array
+
+    def fit_transform_fingerprints(self, fingerprints):
+        """
+        使用 PCA 对指纹数据进行拟合并转换。
+        若 self.n_components 大于 min(n_samples, n_features)，则自动调整。
+        """
+        num_samples, num_features = fingerprints.shape
+        # 自动调整 n_components 防止报错
+        if self.n_components > min(num_samples, num_features):
+            print(f"Warning: n_components={self.n_components} is too large. "  
+                  f"Using {min(num_samples, num_features)} instead.")
+            self.n_components = min(num_samples, num_features)
+
+        if self.pca is None:
+            self.pca = PCA(n_components=self.n_components)
+            transformed_data = self.pca.fit_transform(fingerprints)
+            print(f"Explained variance ratio: {np.sum(self.pca.explained_variance_ratio_):.4f}")
+            return transformed_data
+        else:
+            return self.pca.transform(fingerprints)
+
+    def transform_fingerprints(self, fingerprints):
+        """
+        使用已经拟合的 PCA 模型对新指纹数据进行转换。
+        """
+        if self.pca is None:
+            raise ValueError("PCA model has not been fit yet!")
+        return self.pca.transform(fingerprints)
+
+
+def smiles_to_graph(row, metal_properties_sheet, solvent_properties_sheet, df,
+                    augment=False, fingerprint_reduced=None, is_prediction=False):
+    """
+    将一行数据转换为 PyG 的 Data 对象，包括原子、键、金属信息、溶剂信息、指纹等。
+
+    Parameters:
+    - row (pd.Series): 输入数据行。
+    - metal_properties_sheet (pd.DataFrame): 金属属性数据表。
+    - solvent_properties_sheet (pd.DataFrame): 溶剂属性数据表。
+    - df (pd.DataFrame): 原始数据框。
+    - augment (bool): 是否进行数据增强。
+    - fingerprint_reduced (list): 降维后的指纹数据。
+    - is_prediction (bool): 是否处于预测模式。
+
+    Returns:
+    - Data: PyG Data 对象。
+    """
+    smiles = row['SMILES']
+    metal_name = row['Metal']
+
+    # 获取溶剂数据
+    solvent_info = {
+        'solvent1': {
+            'smiles': row['Solvent1'],
+            'concentration': None
+        },
+        'solvent2': {
+            'smiles': row.get('Solvent2'),
+            'concentration': None
+        },
+        'solvent3': {
+            'smiles': row.get('Solvent3'),
+            'concentration': row.get('Solvent3_Conc', None)
+        },
+        'solvent4': {
+            'smiles': row.get('Solvent4'),
+            'concentration': row.get('Solvent4_Conc', None)
+        }
+    }
+
+    mol_id = row["Identifier"]
+    if not isinstance(smiles, str):
+        return None
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+
+        # 处理原子和键
+    atoms = []
+    for atom in mol.GetAtoms():
+        atom_feats = [
+            atom.GetAtomicNum(),
+            atom.GetFormalCharge(),
+            atom.GetHybridization().real,
+            int(atom.GetIsAromatic()),
+            atom.GetDegree()
+        ]
+        atoms.append(atom_feats)
+
+    bonds = []
+    for bond in mol.GetBonds():
+        bond_feats = [
+            bond.GetBondTypeAsDouble(),
+            int(bond.GetBondDir()) if bond.GetBondDir() != Chem.BondDir.NONE else 0
+        ]
+        bonds.append(bond_feats)
+
+        # 获取金属信息
+    metal_info = metal_properties_sheet[metal_properties_sheet['Metal'] == metal_name]
+    if len(metal_info) == 0:
+        return None
+
+    metal_properties = {
+        'AtomicNum': metal_info['Atomic number'].values[0],
+        'AtomicMass': metal_info['Relative atomic mass'].values[0],
+        'Period': metal_info['Period in periodic table'].values[0],
+        "Third ionisation energy(kJ/mol)": metal_info["Third ionisation energy(kJ/mol)"].values[0],
+        "Second ionisation energy(kJ/mol)": metal_info["Second ionisation energy(kJ/mol)"].values[0],
+        "First ionisation energy(kJ/mol)": metal_info["First ionisation energy(kJ/mol)"].values[0],
+        "Thermal conductivity(W/m/K)": metal_info["Thermal conductivity(W/m/K)"].values[0],
+        "Molar volume(cm3)": metal_info["Molar volume(cm3)"].values[0],
+        "Density(kg/m3)": metal_info["Density(kg/m3)"].values[0],
+        "Molecular single bond covalent radius(ppm)": metal_info["Molecular single bond covalent radius(ppm)"].values[
+            0],
+        "Covalent Radius": metal_info["Covalent Radius"].values[0],
+        "Van der Waals Radius": metal_info["Van der Waals Radius"].values[0],
+        "Polarizability": metal_info["Polarizability"].values[0],
+        "Electronegativity": metal_info["Electronegativity"].values[0],
+        "Electron Affinity": metal_info["Electron Affinity"].values[0]
+    }
+
+    # 定义溶剂相关特征列
+    sol_data = ([f'EState_VSA{i}' for i in range(1, 12)] +
+                [f'VSA_EState{i}' for i in range(1, 10 + 1)] + [
+                    'NumAromaticRings',
+                    'NumHeteroatoms',
+                    'FractionCSP3',
+                    'NumRings',
+                    "Molar Refractivity",
+                    "BalabanJ",
+                    "BertzCT",
+                    "MolLogP",
+                    "MolWt",
+                    "NumHDonors",
+                    "NumHAcceptors",
+                    "NumRotatableBonds",
+                    "TPSA",
+                    "LabuteASA"
+                ])
+
+    # 数据增强
+    if augment:
+        # 分子图增强
+        if random.random() < 0.5:
+            # 随机旋转分子图：调整边的方向
+            edge_index = [(bond.GetEndAtomIdx(), bond.GetBeginAtomIdx()) for bond in mol.GetBonds()]
+        else:
+            edge_index = [(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()) for bond in mol.GetBonds()]
+
+            # 随机扰动键特征
+        for bond in bonds:
+            if random.random() < 0.2:
+                bond[0] += random.uniform(-0.1, 0.1)  # 扰动键类型
+            if random.random() < 0.2:
+                bond[1] = random.randint(0, 3)  # 随机调整键方向
+
+        # 添加噪声到原子特征
+        for atom in atoms:
+            if random.random() < 0.2:
+                atom[1] += random.uniform(-0.1, 0.1)  # 扰动电荷
+
+    def get_solvent_properties(solvent_data):
+        smiles_ = solvent_data['smiles']
+        concentration = solvent_data['concentration']
+
+        if smiles_ is None:
+            # 无溶剂信息则返回全零
+            return torch.zeros(len(sol_data) + 1, dtype=torch.float).view(1, -1)
+
+            # 在 solvent_properties_sheet 中查找对应行
+        solvent_row = solvent_properties_sheet[solvent_properties_sheet['SMILES'] == smiles_]
+        if len(solvent_row) == 0:
+            return torch.zeros(len(sol_data) + 1, dtype=torch.float).view(1, -1)
+
+        base_features = torch.tensor([solvent_row[prop].values[0] for prop in sol_data],
+                                     dtype=torch.float)
+        conc_value = float(concentration) if concentration is not None else 0.0
+        concentration_tensor = torch.tensor([conc_value], dtype=torch.float)
+        combined_features = torch.cat([base_features, concentration_tensor], dim=0)
+
+        return combined_features.view(1, -1)
+
+    solvent1_properties = get_solvent_properties(solvent_info['solvent1'])
+    solvent2_properties = get_solvent_properties(solvent_info['solvent2'])
+    solvent3_properties = get_solvent_properties(solvent_info['solvent3'])
+    solvent4_properties = get_solvent_properties(solvent_info['solvent4'])
+
+    x = torch.tensor(atoms, dtype=torch.float)
+    edge_index = torch.tensor(
+        [(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()) for bond in mol.GetBonds()],
+        dtype=torch.long
+    ).t().contiguous()
+    edge_attr = torch.tensor(bonds, dtype=torch.float)
+
+    metal_feats = torch.tensor(list(metal_properties.values()), dtype=torch.float).view(1, -1)
+
+    # 将降维后的指纹转换为张量并保证维度一致
+    fingerprint_reduced_tensor = torch.tensor(fingerprint_reduced, dtype=torch.float).unsqueeze(0)
+
+    # 处理无标签情况
+    if is_prediction:
+        y_value = None  # 在预测模式下不使用 y 值
+    else:
+        y_value = row['Count']  # 正常模式下使用 Count 列
+
+    # 构造 PyG Data 对象
+    return Data(
+        x=x,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        y=torch.tensor([y_value], dtype=torch.float) if y_value is not None else None,
+        metal_feats=metal_feats,
+        solvent1_feats=solvent1_properties,
+        solvent2_feats=solvent2_properties,
+        solvent3_feats=solvent3_properties,
+        solvent4_feats=solvent4_properties,
+        fingerprint=fingerprint_reduced_tensor,
+        smiles=smiles,
+        id=mol_id
+    )
+
+
+def process_data_with_fingerprints(df, metal_properties_sheet, solvent_properties_sheet,
+                                   fingerprints_transformed, augment=False, data_split="train",is_predicition=False):
+    """
+    Converts a DataFrame into a list of PyG Data objects, associating each with fingerprint data.
+
+    Parameters:
+    - df (pd.DataFrame): The input DataFrame containing molecular data.
+    - metal_properties_sheet (str): Path or identifier for metal properties.
+    - solvent_properties_sheet (str): Path or identifier for solvent properties.
+    - fingerprints_transformed (list): List of transformed fingerprint data corresponding to the DataFrame.
+    - augment (bool): Whether to apply data augmentation.
+    - data_split (str): Indicates the source of the data ('train', 'val', 'test').
+
+    Returns:
+    - list: A list of PyG Data objects with associated fingerprint data and split information.
+    """
+    data_list = []
+    for (idx, row), fp in zip(df.iterrows(), fingerprints_transformed):
+        try:
+            data_obj = smiles_to_graph(
+                row,
+                metal_properties_sheet,
+                solvent_properties_sheet,
+                df,
+                augment=augment,
+                fingerprint_reduced=fp,
+                is_prediction=is_predicition
+            )
+
+            data_obj.group_id = row["group_id"]
+            if data_obj is not None:
+                # Add data source identifier
+                data_obj.split = data_split  # New split attribute
+                data_list.append(data_obj)
+        except Exception as e:
+            print(f"Error processing row {idx}: {e}")  # Log the error for debugging
+
+    return data_list
+
