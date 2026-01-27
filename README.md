@@ -1,2 +1,5 @@
 1.GNN中process_data为预处理文件，model为模型架构文件，train_3为预训练过程，train_3_2为迁移学习过程，run为整体的工作流
-2.
+2.CSD为挖掘CSD数据库中的代码工作流程
+3.Ligands and predicted △n.xlsx该文件为生成分子的总文件
+4.RL_RUN为强化学习以及VAE框架的工作流代码
+best_model.pth为强化学习的最佳模型
