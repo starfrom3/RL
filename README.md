@@ -79,7 +79,6 @@ AI‑driven design of ligands targets improving Am(III)/Eu(III) selectivity by e
   - conda create -n ligand-ai python=3.9
   - conda activate ligand-ai
   - conda install -c conda-forge rdkit
-  - pip install -r requirements.txt
 
 ---
 
@@ -162,25 +161,10 @@ AI‑driven design of ligands targets improving Am(III)/Eu(III) selectivity by e
 
 ---
 
-## 贡献指南 / Contributing
-
-- 贡献前请阅读 CODE_OF_CONDUCT.md（如有）与 CONTRIBUTING.md
-- 常见工作流：
-  - Fork → 新建 feature 分支 → 提交 PR → 通过 CI → 合并
-- 代码风格、测试、文档更新等要求请在 PR 描述中注明。
-
----
-
-## 许可 / License
-
-本项目遵循 MIT 许可证。请参阅 LICENSE 文件了解更多细节。
-
----
-
 ## 作者与联系 / Authors & Contact
 
 - 作者：阙宇龙、杨栋嵊、张智渊、刘冲等（示例名称）
-- 联系方式：示例邮箱
+- 联系方式：2023223070042@stu.scu.edu.cn
 
 ---
 
