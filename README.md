@@ -19,7 +19,6 @@ AI‑driven design of ligands targets improving Am(III)/Eu(III) selectivity by e
 - [API 与代码结构 / API & Code Structure](#api--code-structure)
 - [贡献指南 / Contributing](#contributing)
 - [许可证 / License](#license)
-- [致谢 / Acknowledgments & References](#acknowledgments--references)
 - [联系方式 / Contact](#contact)
 
 ---
