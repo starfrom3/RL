@@ -39,16 +39,15 @@ AI‑driven design of ligands targets improving Am(III)/Eu(III) selectivity by e
 
 ## 快速开始 / Quick Start
 
-1) 克隆仓库（示例）
-- git clone git@github.com:your-org/ai-ligand-design.git
+1) 克隆仓库
+- git clone git@github.com:starfrom3/RL.git
 - cd ai-ligand-design
 
 2) 设置环境
 - 推荐使用 Conda：
-  - conda create -n ligand-ai python=3.8
+  - conda create -n ligand-ai python=3.9
   - conda activate ligand-ai
   - conda install -c rdkit rdkit
-  - pip install -r requirements.txt
 
 3) 数据准备
 - 将数据放置在 data/ 目录，包含：
@@ -69,7 +68,7 @@ AI‑driven design of ligands targets improving Am(III)/Eu(III) selectivity by e
 
 ## 安装与依赖 / Installation & Dependencies
 
-- 语言/环境：Python 3.8+  
+- 语言/环境：Python 3.9+  
 - 关键依赖与组件：
   - PyTorch（或其他你们团队使用的深度学习框架）
   - RDKit（化学信息学工具，用于 SMILES ↔ 图结构转换、指纹计算）
@@ -77,7 +76,7 @@ AI‑driven design of ligands targets improving Am(III)/Eu(III) selectivity by e
   - scikit-learn、numpy、pandas、tqdm、matplotlib（可选用于可视化）
 - 数据版本控制：若使用 Git LFS 或大文件存储，请确保配额与设置合规
 - 运行环境示例（conda 方式）：
-  - conda create -n ligand-ai python=3.8
+  - conda create -n ligand-ai python=3.9
   - conda activate ligand-ai
   - conda install -c conda-forge rdkit
   - pip install -r requirements.txt
@@ -109,7 +108,7 @@ AI‑driven design of ligands targets improving Am(III)/Eu(III) selectivity by e
 
 ## 运行实验 / Running Experiments
 
-- 配置文件示例：configs/am_eu_config.yaml
+- 配置文件示例：configs/config.yaml
 - 关键参数（示例，可根据实际实现调整）：
   - data_path: data/
   - model:
