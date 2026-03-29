@@ -33,6 +33,8 @@ AI‑driven design of ligands targets improving Am(III)/Eu(III) selectivity by e
   - 基于 RL 的目标导向搜索，在潜在空间中提升 Δn 值对应的分离潜力；
   - 迁移学习与嵌套交叉验证在极少样本条件下的鲁棒性分析。
 - 产出概览：生成的候选分子数量级（如 9,464）及其核心骨架分布、以及多组 Murcko 骨架与 Δn 的关联分析。
+- 全部pth文件以及生成分子的链接如下：我用夸克网盘给你分享了「attn5_2」，点击链接或复制整段内容，打开「夸克APP」即可获取。
+/~68663XvG1P~:/链接：https://pan.quark.cn/s/c9532ff19bb4
 
 ---
 
